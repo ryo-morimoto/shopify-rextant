@@ -6,6 +6,7 @@ mod map;
 mod markdown;
 mod mcp_framing;
 mod on_demand;
+mod search;
 mod source;
 mod url_policy;
 mod util;
@@ -22,8 +23,8 @@ use db::coverage::{
     failed_coverage_rows, insert_coverage_event, update_coverage_failed, update_coverage_repaired,
 };
 use db::docs::{
-    all_docs, count_docs, count_where, doc_from_row, enqueue_version_rebuild, get_doc,
-    indexed_version_exists, mark_docs_deprecated, parse_json_string_vec, refresh_indexed_versions,
+    all_docs, count_docs, count_where, enqueue_version_rebuild, get_doc, indexed_version_exists,
+    mark_docs_deprecated, parse_json_string_vec, refresh_indexed_versions,
     stale_refresh_candidates, upsert_doc,
 };
 use db::graph::{insert_edge, load_edges};
@@ -57,29 +58,31 @@ use map::plan::{
 };
 use map::warnings::{index_age_days, map_coverage_warning};
 use markdown::{
-    MarkdownLink, SectionInfo, dedupe_links_by_path, extract_sections, parse_markdown_links,
-    parse_sitemap_links, remove_fenced_code_blocks, section_content, title_from_markdown,
+    MarkdownLink, dedupe_links_by_path, extract_sections, parse_markdown_links, parse_sitemap_links,
+    remove_fenced_code_blocks, section_content, title_from_markdown,
 };
 use url_policy::{
     canonical_doc_path, classify_api_surface, classify_content_class, classify_doc_type,
     extract_version, is_indexable_shopify_url, raw_doc_candidates, raw_path_for, reading_time_min,
 };
 use util::hash::hex_sha256;
-use util::json::{doc_json_field, escape_query, merge_json_arrays, print_json, to_json_value};
+use util::json::{merge_json_arrays, print_json, to_json_value};
 use util::time::now_iso;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use lindera::dictionary::load_dictionary;
-use lindera::mode::Mode;
-use lindera::segmenter::Segmenter;
-use lindera_tantivy::tokenizer::LinderaTokenizer;
 use mcp_framing::{read_message as read_mcp_message, write_json as write_mcp_message};
 use on_demand::{
     FetchCandidate as OnDemandFetchCandidate, FetchPolicy as OnDemandFetchPolicy,
     is_allowed_path as is_on_demand_allowed_path,
 };
+use search::index_io::{
+    add_tantivy_doc, create_or_reset_index, rebuild_tantivy_from_db, upsert_tantivy_doc,
+};
+use search::runtime::{SearchRuntime, sqlite_like_search};
+use search::schema::{SearchFields, search_schema};
+use search::tokenizer::{japanese_segmenter, register_japanese_tokenizer};
 use source::reqwest_source::ReqwestTextSource;
 pub(crate) use source::text_source::TextSource;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -94,15 +97,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{
-    Field, IndexRecordOption, STORED, STRING, Schema, TEXT, TantivyDocument, TextFieldIndexing,
-    TextOptions,
-};
-use tantivy::{Document, Index, Term, doc};
+use tantivy::doc;
 
 const SHOPIFY_LLMS_URL: &str = "https://shopify.dev/llms.txt";
 const SHOPIFY_SITEMAP_URL: &str = "https://shopify.dev/sitemap.xml";
@@ -216,11 +213,11 @@ enum CoverageCommand {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
-    home: PathBuf,
-    data: PathBuf,
-    raw: PathBuf,
-    tantivy: PathBuf,
-    db: PathBuf,
+    pub(crate) home: PathBuf,
+    pub(crate) data: PathBuf,
+    pub(crate) raw: PathBuf,
+    pub(crate) tantivy: PathBuf,
+    pub(crate) db: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,7 +411,7 @@ impl Paths {
         })
     }
 
-    fn raw_file(&self, raw_path: &str) -> PathBuf {
+    pub(crate) fn raw_file(&self, raw_path: &str) -> PathBuf {
         self.raw.join(raw_path)
     }
 
@@ -2295,155 +2292,6 @@ fn search_docs_with_runtime(
     runtime.search(&conn, query, version, limit)
 }
 
-struct SearchRuntime {
-    index: Index,
-    fields: SearchFields,
-    reader: tantivy::IndexReader,
-}
-
-impl SearchRuntime {
-    fn open(paths: &Paths) -> Result<Option<Self>> {
-        if !paths.tantivy.join("meta.json").exists() {
-            return Ok(None);
-        }
-        let index = Index::open_in_dir(&paths.tantivy)?;
-        let fields = match SearchFields::from_schema(&index.schema()) {
-            Ok(fields) => fields,
-            Err(_) => return Ok(None),
-        };
-        let reader = index.reader()?;
-        Ok(Some(Self {
-            index,
-            fields,
-            reader,
-        }))
-    }
-
-    fn search(
-        &self,
-        conn: &Connection,
-        query: &str,
-        version: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<DocRecord>> {
-        let searcher = self.reader.searcher();
-        let mut query_fields = vec![self.fields.title, self.fields.path];
-        if query_needs_japanese_tokenizer(query) {
-            register_japanese_tokenizer(&self.index)?;
-            query_fields.extend(self.fields.content_fields());
-        } else {
-            query_fields.push(self.fields.content_en);
-        }
-        let parser = QueryParser::for_index(&self.index, query_fields);
-        let parsed = parser
-            .parse_query(query)
-            .or_else(|_| parser.parse_query(&escape_query(query)))?;
-        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit))?;
-        let schema = self.index.schema();
-        let mut records = Vec::new();
-        for (_score, address) in top_docs {
-            let retrieved = searcher.doc::<TantivyDocument>(address)?;
-            let Some(path) = doc_json_field(&retrieved.to_json(&schema), "path") else {
-                continue;
-            };
-            if let Some(record) = get_doc(conn, &path)? {
-                if version.is_none_or(|v| {
-                    record.version.is_none() || record.version.as_deref() == Some(v)
-                }) {
-                    records.push(record);
-                }
-            }
-        }
-        Ok(records)
-    }
-}
-
-fn query_needs_japanese_tokenizer(query: &str) -> bool {
-    query.chars().any(|ch| !ch.is_ascii())
-}
-
-fn sqlite_like_search(
-    conn: &Connection,
-    query: &str,
-    version: Option<&str>,
-    limit: usize,
-) -> Result<Vec<DocRecord>> {
-    let like = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
-    let mut stmt = conn.prepare(
-        "SELECT path, title, url, version, doc_type, api_surface, content_class, content_sha,
-                last_verified, last_changed, freshness, references_deprecated, deprecated_refs,
-                summary_raw, reading_time_min, raw_path, source
-         FROM docs
-         WHERE (title LIKE ?1 ESCAPE '\\' OR path LIKE ?1 ESCAPE '\\' OR summary_raw LIKE ?1 ESCAPE '\\')
-           AND (?2 IS NULL OR version IS NULL OR version = ?2)
-         ORDER BY hit_count DESC, title
-         LIMIT ?3",
-    )?;
-    let rows = stmt.query_map(params![like, version, limit as i64], doc_from_row)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn rebuild_tantivy_from_db(paths: &Paths) -> Result<()> {
-    let schema = search_schema();
-    let index = create_or_reset_index(paths, schema.clone(), true)?;
-    register_japanese_tokenizer(&index)?;
-    let fields = SearchFields::from_schema(&schema)?;
-    let conn = open_db(paths)?;
-    let mut stmt = conn.prepare(
-        "SELECT path, title, url, version, doc_type, api_surface, content_class, content_sha,
-                last_verified, last_changed, freshness, references_deprecated, deprecated_refs,
-                summary_raw, reading_time_min, raw_path, source
-         FROM docs",
-    )?;
-    let docs = stmt.query_map([], doc_from_row)?;
-    let mut writer = index.writer(50_000_000)?;
-    for doc in docs {
-        let doc = doc?;
-        let content = fs::read_to_string(paths.raw_file(&doc.raw_path)).unwrap_or_default();
-        add_tantivy_doc(&mut writer, fields, &doc, &content)?;
-    }
-    writer.commit()?;
-    Ok(())
-}
-
-fn upsert_tantivy_doc(paths: &Paths, record: &DocRecord, content: &str) -> Result<()> {
-    let schema = search_schema();
-    let index = create_or_reset_index(paths, schema.clone(), false)?;
-    register_japanese_tokenizer(&index)?;
-    let fields = match SearchFields::from_schema(&index.schema()) {
-        Ok(fields) => fields,
-        Err(_) => {
-            rebuild_tantivy_from_db(paths)?;
-            return Ok(());
-        }
-    };
-    let mut writer = index.writer(50_000_000)?;
-    writer.delete_term(Term::from_field_text(fields.path, &record.path));
-    add_tantivy_doc(&mut writer, fields, record, content)?;
-    writer.commit()?;
-    Ok(())
-}
-
-fn add_tantivy_doc(
-    writer: &mut tantivy::IndexWriter<TantivyDocument>,
-    fields: SearchFields,
-    record: &DocRecord,
-    content: &str,
-) -> Result<()> {
-    writer.add_document(doc!(
-        fields.path => record.path.clone(),
-        fields.title => record.title.clone(),
-        fields.url => record.url.clone(),
-        fields.version => record.version.clone().unwrap_or_else(|| "evergreen".to_string()),
-        fields.api_surface => record.api_surface.clone().unwrap_or_else(|| "unknown".to_string()),
-        fields.doc_type => record.doc_type.clone(),
-        fields.content_en => content.chars().take(4_000).collect::<String>(),
-        fields.content_ja => content.chars().take(4_000).collect::<String>(),
-    ))?;
-    Ok(())
-}
-
 #[derive(Debug, Default)]
 struct ChangelogPollReport {
     entries_seen: usize,
@@ -3366,99 +3214,13 @@ fn scheduled_changes_for_refs(conn: &Connection, refs: &[String]) -> Result<Vec<
     Ok(changes)
 }
 
-#[derive(Clone, Copy)]
-struct SearchFields {
-    path: Field,
-    title: Field,
-    url: Field,
-    version: Field,
-    api_surface: Field,
-    doc_type: Field,
-    content_en: Field,
-    content_ja: Field,
-}
-
-impl SearchFields {
-    fn from_schema(schema: &Schema) -> Result<Self> {
-        Ok(Self {
-            path: schema.get_field("path")?,
-            title: schema.get_field("title")?,
-            url: schema.get_field("url")?,
-            version: schema.get_field("version")?,
-            api_surface: schema.get_field("api_surface")?,
-            doc_type: schema.get_field("doc_type")?,
-            content_en: schema.get_field("content_en")?,
-            content_ja: schema.get_field("content_ja")?,
-        })
-    }
-
-    fn content_fields(&self) -> [Field; 2] {
-        [self.content_en, self.content_ja]
-    }
-}
-
-fn search_schema() -> Schema {
-    let mut builder = Schema::builder();
-    builder.add_text_field("path", STRING | STORED);
-    builder.add_text_field("title", TEXT | STORED);
-    builder.add_text_field("url", STRING | STORED);
-    builder.add_text_field("version", STRING | STORED);
-    builder.add_text_field("api_surface", STRING | STORED);
-    builder.add_text_field("doc_type", STRING | STORED);
-    builder.add_text_field("content_en", TEXT);
-    let japanese_text = TextOptions::default().set_indexing_options(
-        TextFieldIndexing::default()
-            .set_tokenizer("lindera_ipadic")
-            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-    );
-    builder.add_text_field("content_ja", japanese_text);
-    builder.build()
-}
-
-fn register_japanese_tokenizer(index: &Index) -> Result<()> {
-    index.tokenizers().register(
-        "lindera_ipadic",
-        LinderaTokenizer::from_segmenter(japanese_segmenter()?),
-    );
-    Ok(())
-}
-
-fn japanese_segmenter() -> Result<Segmenter> {
-    static JAPANESE_SEGMENTER: OnceLock<std::result::Result<Segmenter, String>> = OnceLock::new();
-    match JAPANESE_SEGMENTER.get_or_init(|| {
-        load_dictionary("embedded://ipadic")
-            .map_err(|error| error.to_string())
-            .map(|dictionary| Segmenter::new(Mode::Normal, dictionary, None))
-    }) {
-        Ok(segmenter) => Ok(segmenter.clone()),
-        Err(error) => {
-            bail!("load Japanese tokenizer dictionary: {error}")
-        }
-    }
-}
-
-fn create_or_reset_index(paths: &Paths, schema: Schema, reset: bool) -> Result<Index> {
-    if reset && paths.tantivy.exists() {
-        fs::remove_dir_all(&paths.tantivy)?;
-    }
-    fs::create_dir_all(&paths.tantivy)?;
-    if paths.tantivy.join("meta.json").exists() {
-        let index = Index::open_in_dir(&paths.tantivy)?;
-        if SearchFields::from_schema(&index.schema()).is_ok() {
-            Ok(index)
-        } else {
-            fs::remove_dir_all(&paths.tantivy)?;
-            fs::create_dir_all(&paths.tantivy)?;
-            Index::create_in_dir(&paths.tantivy, schema).map_err(Into::into)
-        }
-    } else {
-        Index::create_in_dir(&paths.tantivy, schema).map_err(Into::into)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use tantivy::Index;
+    #[allow(unused_imports)]
+    use tantivy::schema::{STORED, STRING, Schema, TEXT, TantivyDocument};
 
     struct MockTextSource {
         texts: std::collections::HashMap<String, String>,
