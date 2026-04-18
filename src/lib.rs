@@ -1,9 +1,27 @@
+mod changelog;
+mod graphql;
+mod map;
 mod markdown;
 mod mcp_framing;
 mod on_demand;
 mod url_policy;
 mod util;
 
+use changelog::feed::{parse_changelog_feed, version_candidates_desc};
+use changelog::impact::{
+    candidate_to_doc_path, extract_impact_candidates, impact_affected_types, is_api_version,
+    looks_like_reference_candidate, scheduled_changes_from_entry, surface_from_category,
+};
+use changelog::types::{ChangelogEntryInput, ResolvedImpact, ScheduledChangeRecord};
+use graphql::resolve::{extract_named_type, markdown_mentions_type, resolve_concept_id};
+use graphql::schema_urls::{
+    admin_graphql_direct_proxy_url, concept_id, graphql_concept_kind, graphql_reference_path,
+};
+use map::plan::{
+    QueryPlanStep, dedupe_docs_by_path, doc_type_rank, graph_query_plan, is_doc_like_query,
+    node_kind_rank,
+};
+use map::warnings::{index_age_days, map_coverage_warning};
 use markdown::{
     MarkdownLink, SectionInfo, dedupe_links_by_path, extract_sections, parse_markdown_links,
     parse_sitemap_links, remove_fenced_code_blocks, section_content, title_from_markdown,
@@ -19,7 +37,6 @@ use util::time::now_iso;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use feed_rs::parser;
 use lindera::dictionary::load_dictionary;
 use lindera::mode::Mode;
 use lindera::segmenter::Segmenter;
@@ -29,7 +46,6 @@ use on_demand::{
     FetchCandidate as OnDemandFetchCandidate, FetchPolicy as OnDemandFetchPolicy,
     is_allowed_path as is_on_demand_allowed_path,
 };
-use regex::Regex;
 use reqwest::StatusCode;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -277,14 +293,6 @@ pub(crate) struct MapResponse {
     query_plan: Vec<QueryPlanStep>,
     index_status: StatusResponse,
     meta: MapMeta,
-}
-
-#[derive(Debug, Serialize)]
-struct QueryPlanStep {
-    step: usize,
-    action: String,
-    path: Option<String>,
-    reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2013,10 +2021,6 @@ fn shopify_map_with_runtime(
     })
 }
 
-fn is_doc_like_query(value: &str) -> bool {
-    value.starts_with("/docs/") || value.starts_with("/changelog") || value == "/llms.txt"
-}
-
 fn find_concept_by_name(
     conn: &Connection,
     name: &str,
@@ -2349,43 +2353,6 @@ fn center_for_key(
     })
 }
 
-fn graph_query_plan(paths: &[String], lens: &str, radius: usize) -> Vec<QueryPlanStep> {
-    paths
-        .iter()
-        .take(3)
-        .enumerate()
-        .map(|(i, path)| QueryPlanStep {
-            step: i + 1,
-            action: "fetch".to_string(),
-            path: Some(path.clone()),
-            reason: if i == 0 {
-                format!("Primary graph source for lens={lens}, radius={radius}; fetch raw source before answering.")
-            } else {
-                "Related graph source to compare against the primary source.".to_string()
-            },
-        })
-        .collect()
-}
-
-fn node_kind_rank(kind: &str) -> usize {
-    match kind {
-        "doc" => 0,
-        "concept" => 1,
-        _ => 2,
-    }
-}
-
-fn doc_type_rank(doc_type: &str) -> usize {
-    match doc_type {
-        "reference" => 0,
-        "how-to" => 1,
-        "tutorial" => 2,
-        "explanation" => 3,
-        "migration" => 4,
-        _ => 9,
-    }
-}
-
 pub(crate) fn status(paths: &Paths) -> Result<StatusResponse> {
     let mut warnings = Vec::new();
     if !paths.db.exists() {
@@ -2707,35 +2674,6 @@ fn versions_available(paths: &Paths) -> Result<Vec<String>> {
         .map_err(Into::into)
 }
 
-fn index_age_days(last_full_build: Option<&str>) -> i64 {
-    last_full_build
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|dt| (Utc::now() - dt.with_timezone(&Utc)).num_days())
-        .unwrap_or(0)
-}
-
-fn map_coverage_warning(status: &StatusResponse) -> Option<String> {
-    if status.doc_count == 0 {
-        Some("Index is empty; run shopify-rextant build.".to_string())
-    } else if status.coverage.failed_count > 0 || status.coverage.skipped_count > 0 {
-        Some(format!(
-            "Coverage has {} skipped and {} failed URLs from the last build.",
-            status.coverage.skipped_count, status.coverage.failed_count
-        ))
-    } else if index_age_days(status.last_full_build.as_deref()) > 14 {
-        Some("Index is older than 14 days; run shopify-rextant refresh.".to_string())
-    } else {
-        None
-    }
-}
-
-fn dedupe_docs_by_path(docs: Vec<DocRecord>) -> Vec<DocRecord> {
-    let mut seen = HashSet::new();
-    docs.into_iter()
-        .filter(|doc| seen.insert(doc.path.clone()))
-        .collect()
-}
-
 pub(crate) fn search_docs(
     paths: &Paths,
     query: &str,
@@ -2982,35 +2920,6 @@ struct CoverageEvent {
     reason: Option<String>,
     http_status: Option<u16>,
     checked_at: String,
-}
-
-#[derive(Debug, Clone)]
-struct ChangelogEntryInput {
-    id: String,
-    title: String,
-    link: String,
-    body: String,
-    posted_at: String,
-    categories: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedImpact {
-    refs: Vec<String>,
-    doc_paths: Vec<String>,
-    concept_ids: Vec<String>,
-    surfaces: Vec<String>,
-    unresolved_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ScheduledChangeRecord {
-    id: String,
-    type_name: String,
-    change: String,
-    effective_date: Option<String>,
-    migration_hint: Option<String>,
-    source_changelog_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -3269,16 +3178,6 @@ async fn check_new_versions_from_source<S: TextSource>(
     Ok(report)
 }
 
-fn version_candidates_desc(page: &str) -> Vec<String> {
-    let re = Regex::new(r"\b20\d{2}-\d{2}\b").expect("valid API version regex");
-    re.find_iter(page)
-        .map(|m| m.as_str().to_string())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
 async fn validate_admin_graphql_version<S: TextSource>(source: &S, version: &str) -> Result<bool> {
     let url = admin_graphql_direct_proxy_url(version);
     let Ok(snapshot) = source.fetch_admin_graphql_introspection(&url).await else {
@@ -3290,55 +3189,6 @@ async fn validate_admin_graphql_version<S: TextSource>(source: &S, version: &str
         .pointer("/data/__schema/types")
         .and_then(Value::as_array)
         .is_some_and(|types| !types.is_empty()))
-}
-
-fn parse_changelog_feed(xml: &str) -> Result<Vec<ChangelogEntryInput>> {
-    let feed = parser::parse(xml.as_bytes()).context("parse RSS/Atom changelog feed")?;
-    Ok(feed
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let link = entry
-                .links
-                .first()
-                .map(|link| link.href.clone())
-                .unwrap_or_else(|| entry.id.clone());
-            let id = if entry.id.trim().is_empty() {
-                link.clone()
-            } else {
-                entry.id
-            };
-            let title = entry
-                .title
-                .map(|title| title.content)
-                .unwrap_or_else(|| id.clone());
-            let body = entry
-                .content
-                .and_then(|content| content.body)
-                .or_else(|| entry.summary.map(|summary| summary.content))
-                .unwrap_or_default();
-            let posted_at = entry
-                .published
-                .or(entry.updated)
-                .unwrap_or_else(Utc::now)
-                .to_rfc3339();
-            let categories = entry
-                .categories
-                .into_iter()
-                .flat_map(|category| [Some(category.term), category.label].into_iter().flatten())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            ChangelogEntryInput {
-                id,
-                title,
-                link,
-                body,
-                posted_at,
-                categories,
-            }
-        })
-        .collect())
 }
 
 fn changelog_entry_exists(conn: &Connection, id: &str) -> Result<bool> {
@@ -3433,77 +3283,6 @@ fn resolve_changelog_impact(
     })
 }
 
-fn extract_impact_candidates(entry: &ChangelogEntryInput) -> Vec<String> {
-    let mut candidates = BTreeSet::new();
-    let text = format!(
-        "{}\n{}\n{}\n{}",
-        entry.title,
-        entry.body,
-        entry.link,
-        entry.categories.join("\n")
-    );
-    let doc_re = Regex::new(
-        r#"https://shopify\.dev/(?:docs|changelog)/[^\s<>)"']+|/(?:docs|changelog)/[^\s<>)"']+"#,
-    )
-    .expect("valid changelog doc path regex");
-    for caps in doc_re.captures_iter(&text) {
-        candidates.insert(trim_candidate(caps.get(0).unwrap().as_str()));
-    }
-    let version_re = Regex::new(r"\b20\d{2}-\d{2}\b").expect("valid API version regex");
-    for caps in version_re.captures_iter(&text) {
-        candidates.insert(caps.get(0).unwrap().as_str().to_string());
-    }
-    let symbol_re = Regex::new(r"\b[A-Z][A-Za-z0-9]+(?:\.[A-Za-z_][A-Za-z0-9_]*)?\b")
-        .expect("valid GraphQL symbol regex");
-    for caps in symbol_re.captures_iter(&text) {
-        candidates.insert(trim_candidate(caps.get(0).unwrap().as_str()));
-    }
-    candidates.into_iter().collect()
-}
-
-fn trim_candidate(value: &str) -> String {
-    value
-        .trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | '(' | '"' | '\''))
-        .to_string()
-}
-
-fn is_api_version(value: &str) -> bool {
-    Regex::new(r"^20\d{2}-\d{2}$")
-        .expect("valid API version regex")
-        .is_match(value)
-}
-
-fn candidate_to_doc_path(candidate: &str) -> Option<String> {
-    if candidate.starts_with("/docs/") || candidate.starts_with("/changelog") {
-        return Some(candidate.trim_end_matches('/').to_string());
-    }
-    if candidate.starts_with("https://shopify.dev/")
-        || candidate.starts_with("https://www.shopify.dev/")
-    {
-        return canonical_doc_path(candidate).ok();
-    }
-    None
-}
-
-fn looks_like_reference_candidate(candidate: &str) -> bool {
-    candidate.contains('.') || candidate.chars().next().is_some_and(char::is_uppercase)
-}
-
-fn surface_from_category(category: &str) -> Option<String> {
-    let normalized = category.to_ascii_lowercase();
-    if normalized.contains("admin graphql") || normalized.contains("graphql admin") {
-        Some("admin_graphql".to_string())
-    } else if normalized.contains("storefront") {
-        Some("storefront".to_string())
-    } else if normalized.contains("liquid") {
-        Some("liquid".to_string())
-    } else if normalized.contains("polaris") {
-        Some("polaris".to_string())
-    } else {
-        None
-    }
-}
-
 fn collect_graph_neighbors(
     conn: &Connection,
     edges: &[GraphEdgeRecord],
@@ -3561,73 +3340,6 @@ fn collect_graph_neighbors(
     Ok(())
 }
 
-fn scheduled_changes_from_entry(
-    entry: &ChangelogEntryInput,
-    impact: &ResolvedImpact,
-) -> Vec<ScheduledChangeRecord> {
-    let change = classify_change(entry);
-    if change.is_none() || impact.refs.is_empty() {
-        return Vec::new();
-    }
-    let change = change.unwrap();
-    let effective_date = extract_effective_date(entry);
-    let migration_hint = extract_migration_hint(entry);
-    impact
-        .refs
-        .iter()
-        .map(|reference| {
-            let id = hex_sha256(&format!(
-                "{}:{}:{}:{}",
-                entry.id,
-                reference,
-                change,
-                effective_date.as_deref().unwrap_or("")
-            ));
-            ScheduledChangeRecord {
-                id,
-                type_name: reference.clone(),
-                change: change.clone(),
-                effective_date: effective_date.clone(),
-                migration_hint: migration_hint.clone(),
-                source_changelog_id: entry.id.clone(),
-            }
-        })
-        .collect()
-}
-
-fn classify_change(entry: &ChangelogEntryInput) -> Option<String> {
-    let text = format!("{}\n{}", entry.title, entry.body).to_ascii_lowercase();
-    if text.contains("removed") || text.contains("removal") || text.contains("will be removed") {
-        Some("removal".to_string())
-    } else if text.contains("deprecated") || text.contains("deprecation") {
-        Some("deprecation".to_string())
-    } else {
-        None
-    }
-}
-
-fn extract_effective_date(entry: &ChangelogEntryInput) -> Option<String> {
-    let text = format!("{}\n{}", entry.title, entry.body);
-    Regex::new(r"\b20\d{2}-\d{2}\b")
-        .expect("valid API version regex")
-        .find(&text)
-        .map(|m| m.as_str().to_string())
-        .or_else(|| {
-            Regex::new(r"\b20\d{2}-\d{2}-\d{2}\b")
-                .expect("valid date regex")
-                .find(&text)
-                .map(|m| m.as_str().to_string())
-        })
-}
-
-fn extract_migration_hint(entry: &ChangelogEntryInput) -> Option<String> {
-    entry
-        .body
-        .lines()
-        .find(|line| line.to_ascii_lowercase().contains("migrat"))
-        .map(|line| line.trim().chars().take(300).collect::<String>())
-}
-
 fn insert_changelog_entry(
     conn: &Connection,
     entry: &ChangelogEntryInput,
@@ -3656,18 +3368,6 @@ fn insert_changelog_entry(
         ],
     )?;
     Ok(())
-}
-
-fn impact_affected_types(impact: &ResolvedImpact) -> Vec<String> {
-    let mut affected = impact
-        .refs
-        .iter()
-        .chain(impact.concept_ids.iter())
-        .cloned()
-        .collect::<Vec<_>>();
-    affected.sort();
-    affected.dedup();
-    affected
 }
 
 fn insert_scheduled_change(conn: &Connection, change: &ScheduledChangeRecord) -> Result<()> {
@@ -3771,10 +3471,6 @@ fn admin_graphql_versions(docs: &[SourceDoc]) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
-}
-
-fn admin_graphql_direct_proxy_url(version: &str) -> String {
-    format!("https://shopify.dev/admin-graphql-direct-proxy/{version}")
 }
 
 fn persist_schema_snapshot(paths: &Paths, version: &str, snapshot: &str) -> Result<()> {
@@ -4144,69 +3840,6 @@ fn add_doc_graph_edges(
         }
     }
     Ok(())
-}
-
-fn graphql_concept_kind(kind: &str) -> &'static str {
-    match kind {
-        "OBJECT" => "graphql_type",
-        "INPUT_OBJECT" => "graphql_input_object",
-        "INTERFACE" => "graphql_interface",
-        "UNION" => "graphql_union",
-        "ENUM" => "graphql_enum",
-        "SCALAR" => "graphql_scalar",
-        _ => "graphql_type",
-    }
-}
-
-fn graphql_reference_path(version: &str, kind: &str, name: &str) -> Option<String> {
-    let section = match kind {
-        "OBJECT" => "objects",
-        "INPUT_OBJECT" => "input-objects",
-        "INTERFACE" => "interfaces",
-        "UNION" => "unions",
-        "ENUM" => "enums",
-        "SCALAR" => "scalars",
-        _ => return None,
-    };
-    Some(format!(
-        "/docs/api/admin-graphql/{version}/{section}/{name}"
-    ))
-}
-
-fn concept_id(version: &str, name: &str) -> String {
-    format!("admin_graphql.{version}.{name}")
-}
-
-fn resolve_concept_id(
-    version: &str,
-    target_name: &str,
-    concept_ids: &HashSet<String>,
-) -> Option<String> {
-    let exact = concept_id(version, target_name);
-    if concept_ids.contains(&exact) {
-        return Some(exact);
-    }
-    if let Some(stripped) = target_name.strip_suffix("Connection") {
-        let stripped_id = concept_id(version, stripped);
-        if concept_ids.contains(&stripped_id) {
-            return Some(stripped_id);
-        }
-    }
-    None
-}
-
-fn extract_named_type(value: &Value) -> Option<String> {
-    if let Some(name) = value.get("name").and_then(Value::as_str) {
-        return Some(name.to_string());
-    }
-    value.get("ofType").and_then(extract_named_type)
-}
-
-fn markdown_mentions_type(markdown: &str, type_name: &str) -> bool {
-    let pattern = format!(r"\b{}\b", regex::escape(type_name));
-    Regex::new(&pattern)
-        .expect("escaped type name regex is valid")
-        .is_match(markdown)
 }
 
 fn insert_unique_concept(
