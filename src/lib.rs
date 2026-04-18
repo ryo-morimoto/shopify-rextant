@@ -1,4 +1,5 @@
 mod changelog;
+mod db;
 mod domain;
 mod graphql;
 mod map;
@@ -14,6 +15,8 @@ use changelog::impact::{
     looks_like_reference_candidate, scheduled_changes_from_entry, surface_from_category,
 };
 use changelog::types::{ChangelogEntryInput, ResolvedImpact, ScheduledChangeRecord};
+use db::meta::{get_meta, set_meta};
+use db::schema::{clear_coverage_reports, clear_graph_tables, init_db, open_db};
 use domain::concepts::ConceptRecord;
 use domain::coverage::CoverageEvent;
 use domain::graph::{GraphBuild, GraphEdgeRecord, GraphNodeKey};
@@ -572,7 +575,7 @@ pub(crate) async fn build_index_from_sources<S: TextSource>(
     fs::create_dir_all(&paths.tantivy)?;
 
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     let schema = search_schema();
     let index = create_or_reset_index(paths, schema.clone(), force)?;
     register_japanese_tokenizer(&index)?;
@@ -707,7 +710,7 @@ async fn coverage_repair_from_source<S: TextSource>(
     source: &S,
 ) -> Result<CoverageRepairSummary> {
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     let rows = failed_coverage_rows(&conn)?;
     let config = load_config(paths)?;
     let policy = OnDemandFetchPolicy::from_config(&config);
@@ -751,7 +754,7 @@ async fn refresh_doc_from_source<S: TextSource>(
     source: &S,
 ) -> Result<()> {
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     let doc = get_doc(&conn, path)?.ok_or_else(|| anyhow!("path not found: {path}"))?;
     let content = fetch_required_text(source, &doc.url).await?;
     let source_doc = SourceDoc {
@@ -768,7 +771,7 @@ async fn refresh_doc_from_source<S: TextSource>(
 
 async fn refresh_stale_docs_from_source<S: TextSource>(paths: &Paths, source: &S) -> Result<()> {
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     update_doc_freshness_states(&conn)?;
     let docs = stale_refresh_candidates(&conn, 100)?;
     let mut refreshed = 0usize;
@@ -1540,7 +1543,7 @@ async fn shopify_fetch_from_source<S: TextSource>(
         .as_deref()
         .ok_or_else(|| ToolError::from(anyhow!("shopify_fetch requires path")))?;
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     if get_doc(&conn, path)?.is_none() && is_on_demand_allowed_path(path) {
         let record = on_demand_fetch_from_input(paths, path, source).await?;
         return fetch_local_doc(paths, &record.path, args).map_err(ToolError::from);
@@ -1570,7 +1573,7 @@ async fn on_demand_fetch_candidate<S: TextSource>(
     fs::create_dir_all(&paths.raw).map_err(|e| ToolError::from(anyhow!(e)))?;
     fs::create_dir_all(&paths.tantivy).map_err(|e| ToolError::from(anyhow!(e)))?;
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     let link = MarkdownLink {
         title: candidate.canonical_path.clone(),
         url: candidate.source_url.clone(),
@@ -1636,7 +1639,7 @@ fn shopify_map_with_runtime(
     let radius = args.radius.unwrap_or(2).clamp(1, 3);
     let lens = args.lens.as_deref().unwrap_or("auto");
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     let index_status = status(paths)?;
     let versions_available = versions_available(paths).unwrap_or_default();
     let version_used = args
@@ -2220,7 +2223,7 @@ pub(crate) fn status(paths: &Paths) -> Result<StatusResponse> {
     }
 
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     let doc_count = count_docs(&conn)?;
     let last_full_build = conn
         .query_row(
@@ -2377,25 +2380,6 @@ fn changelog_status(conn: &Connection) -> Result<ChangelogStatus> {
     })
 }
 
-fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT value FROM schema_meta WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO schema_meta(key, value) VALUES(?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![key, value],
-    )?;
-    Ok(())
-}
-
 fn refresh_indexed_versions(conn: &Connection, docs: &[DocRecord]) -> Result<()> {
     let mut counts = HashMap::<String, i64>::new();
     for doc in docs {
@@ -2508,7 +2492,7 @@ fn versions_available(paths: &Paths) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     let mut stmt = conn.prepare(
         "SELECT DISTINCT COALESCE(version, 'evergreen') FROM docs ORDER BY COALESCE(version, 'evergreen')",
     )?;
@@ -2761,7 +2745,7 @@ async fn poll_changelog_from_source<S: TextSource>(
     source: &S,
 ) -> Result<ChangelogPollReport> {
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     let feed = match source.fetch_text(feed_url).await {
         Ok(feed) => feed,
         Err(error) => {
@@ -2818,7 +2802,7 @@ async fn check_new_versions_from_source<S: TextSource>(
     source: &S,
 ) -> Result<VersionCheckReport> {
     let conn = open_db(paths)?;
-    init_db(&conn)?;
+    init_db(&conn, SCHEMA_VERSION)?;
     let mut report = VersionCheckReport::default();
     let versioning_page = match source.fetch_text(&source_urls.versioning).await {
         Ok(page) => page,
@@ -3597,185 +3581,6 @@ fn store_source_doc(paths: &Paths, source: &SourceDoc) -> Result<DocRecord> {
     })
 }
 
-fn open_db(paths: &Paths) -> Result<Connection> {
-    if let Some(parent) = paths.db.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let conn = Connection::open(&paths.db)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    Ok(conn)
-}
-
-fn init_db(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS schema_meta (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS docs (
-          path TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          url TEXT NOT NULL,
-          version TEXT,
-          doc_type TEXT NOT NULL,
-          api_surface TEXT,
-          content_class TEXT NOT NULL,
-          content_sha TEXT NOT NULL,
-          last_verified TEXT NOT NULL,
-          last_changed TEXT NOT NULL,
-          freshness TEXT NOT NULL,
-          references_deprecated INTEGER NOT NULL DEFAULT 0,
-          deprecated_refs TEXT,
-          summary_raw TEXT NOT NULL,
-          reading_time_min INTEGER,
-          raw_path TEXT NOT NULL,
-          source TEXT NOT NULL DEFAULT 'llms',
-          hit_count INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_docs_version ON docs(version);
-        CREATE INDEX IF NOT EXISTS idx_docs_surface ON docs(api_surface);
-        CREATE INDEX IF NOT EXISTS idx_docs_class ON docs(content_class, api_surface);
-        CREATE INDEX IF NOT EXISTS idx_docs_freshness ON docs(freshness);
-        CREATE INDEX IF NOT EXISTS idx_docs_source ON docs(source);
-        CREATE TABLE IF NOT EXISTS coverage_reports (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          source TEXT NOT NULL,
-          canonical_path TEXT,
-          source_url TEXT NOT NULL,
-          status TEXT NOT NULL,
-          reason TEXT,
-          http_status INTEGER,
-          checked_at TEXT NOT NULL,
-          retry_after TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_coverage_status ON coverage_reports(status, checked_at);
-        CREATE INDEX IF NOT EXISTS idx_coverage_path ON coverage_reports(canonical_path);
-        CREATE TABLE IF NOT EXISTS concepts (
-          id TEXT PRIMARY KEY,
-          kind TEXT NOT NULL,
-          name TEXT NOT NULL,
-          version TEXT,
-          defined_in_path TEXT,
-          deprecated INTEGER NOT NULL DEFAULT 0,
-          deprecated_since TEXT,
-          deprecation_reason TEXT,
-          replaced_by TEXT,
-          kind_metadata TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_concepts_name ON concepts(name);
-        CREATE INDEX IF NOT EXISTS idx_concepts_kind_version ON concepts(kind, version);
-        CREATE TABLE IF NOT EXISTS edges (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          from_type TEXT NOT NULL,
-          from_id TEXT NOT NULL,
-          to_type TEXT NOT NULL,
-          to_id TEXT NOT NULL,
-          kind TEXT NOT NULL,
-          weight REAL NOT NULL DEFAULT 1.0,
-          source_path TEXT,
-          extracted_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_type, from_id);
-        CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_type, to_id);
-        CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
-        CREATE TABLE IF NOT EXISTS changelog_entries (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          url TEXT NOT NULL,
-          posted_at TEXT,
-          body TEXT NOT NULL,
-          categories TEXT NOT NULL,
-          affected_types TEXT NOT NULL,
-          affected_surfaces TEXT NOT NULL,
-          unresolved_affected_refs TEXT NOT NULL,
-          processed_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_changelog_posted_at ON changelog_entries(posted_at);
-        CREATE TABLE IF NOT EXISTS scheduled_changes (
-          id TEXT PRIMARY KEY,
-          type_name TEXT NOT NULL,
-          change TEXT NOT NULL,
-          effective_date TEXT,
-          migration_hint TEXT,
-          source_changelog_id TEXT,
-          FOREIGN KEY (source_changelog_id) REFERENCES changelog_entries(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_scheduled_changes_type ON scheduled_changes(type_name);
-        CREATE INDEX IF NOT EXISTS idx_scheduled_changes_effective ON scheduled_changes(effective_date);
-        CREATE TABLE IF NOT EXISTS indexed_versions (
-          version TEXT PRIMARY KEY,
-          api_surface TEXT NOT NULL,
-          indexed_at TEXT NOT NULL,
-          doc_count INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_indexed_versions_surface ON indexed_versions(api_surface);
-        CREATE TABLE IF NOT EXISTS version_rebuild_queue (
-          version TEXT NOT NULL,
-          api_surface TEXT NOT NULL,
-          status TEXT NOT NULL,
-          reason TEXT NOT NULL,
-          enqueued_at TEXT NOT NULL,
-          PRIMARY KEY(version, api_surface)
-        );
-        CREATE INDEX IF NOT EXISTS idx_version_rebuild_queue_status ON version_rebuild_queue(status, enqueued_at);
-        CREATE TABLE IF NOT EXISTS tasks (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          description TEXT,
-          root_path TEXT,
-          related_paths TEXT NOT NULL
-        );
-        ",
-    )?;
-    ensure_column(conn, "docs", "source", "TEXT NOT NULL DEFAULT 'llms'")?;
-    ensure_column(
-        conn,
-        "docs",
-        "references_deprecated",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    ensure_column(conn, "docs", "deprecated_refs", "TEXT")?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_docs_source ON docs(source)",
-        [],
-    )?;
-    conn.execute(
-        "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![SCHEMA_VERSION],
-    )?;
-    Ok(())
-}
-
-fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for existing in columns {
-        if existing? == column {
-            return Ok(());
-        }
-    }
-    conn.execute(
-        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
-        [],
-    )?;
-    Ok(())
-}
-
-fn clear_coverage_reports(conn: &Connection) -> Result<()> {
-    conn.execute("DELETE FROM coverage_reports", [])?;
-    Ok(())
-}
-
-fn clear_graph_tables(conn: &Connection) -> Result<()> {
-    conn.execute("DELETE FROM edges", [])?;
-    conn.execute("DELETE FROM concepts", [])?;
-    conn.execute("DELETE FROM tasks", [])?;
-    Ok(())
-}
-
 fn insert_coverage_event(conn: &Connection, event: &CoverageEvent) -> Result<()> {
     conn.execute(
         "
@@ -4420,7 +4225,7 @@ mod tests {
     fn seed_draft_order_graph(paths: &Paths) -> Connection {
         fs::create_dir_all(&paths.raw).unwrap();
         let conn = open_db(paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         let source = SourceDoc {
             url: "https://shopify.dev/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem.md"
                 .to_string(),
@@ -4541,7 +4346,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
 
         let changelog_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM changelog_entries", [], |row| {
@@ -4896,7 +4701,7 @@ mod tests {
         write_on_demand_config(&paths, true);
         fs::create_dir_all(&paths.raw).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         let source_doc = SourceDoc {
             url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
             title_hint: Some("Access scopes".to_string()),
@@ -4936,7 +4741,7 @@ mod tests {
             "# Delta\nFresh replacement term.\n",
         )]);
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         let old = store_source_doc(
             &paths,
             &SourceDoc {
@@ -4991,7 +4796,7 @@ mod tests {
         assert_eq!(candidate.url, "https://shopify.dev/docs/apps/build/missing");
         assert!(!candidate.enabled);
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         assert_eq!(count_docs(&conn).unwrap(), 0);
     }
 
@@ -5021,7 +4826,7 @@ mod tests {
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         fs::create_dir_all(&paths.raw).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         let source = SourceDoc {
             url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
             title_hint: Some("Access scopes".to_string()),
@@ -5054,7 +4859,7 @@ mod tests {
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         write_on_demand_config(&paths, true);
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         insert_coverage_event(
             &conn,
             &CoverageEvent {
@@ -5114,7 +4919,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         insert_coverage_event(
             &conn,
             &CoverageEvent {
@@ -5149,7 +4954,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         insert_coverage_event(
             &conn,
             &CoverageEvent {
@@ -5176,7 +4981,7 @@ mod tests {
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         fs::create_dir_all(&paths.raw).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         let source = SourceDoc {
             url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
             title_hint: Some("Access scopes".to_string()),
@@ -5423,7 +5228,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         let source = MockTextSource::new(&[
             (
                 SHOPIFY_VERSIONING_URL,
@@ -5466,7 +5271,7 @@ mod tests {
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         fs::create_dir_all(&paths.raw).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         let source_doc = SourceDoc {
             url: "https://shopify.dev/docs/api/admin-graphql/2026-07/objects/Product.md"
                 .to_string(),
@@ -5500,7 +5305,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         let source = MockTextSource::new(&[(
             SHOPIFY_VERSIONING_URL,
             "Stable version Release date Supported until 2026-10 October 1 2026",
@@ -5781,7 +5586,7 @@ mod tests {
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         fs::create_dir_all(&paths.raw).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         let fresh_source = SourceDoc {
             url: "https://shopify.dev/docs/apps/build/fresh.md".to_string(),
             title_hint: Some("Fresh doc".to_string()),
@@ -6178,7 +5983,7 @@ mod tests {
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         fs::create_dir_all(&paths.raw).unwrap();
         let conn = open_db(&paths).unwrap();
-        init_db(&conn).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
         let source = SourceDoc {
             url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
             title_hint: Some("Access scopes".to_string()),
