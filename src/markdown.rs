@@ -2,7 +2,7 @@ use regex::Regex;
 use serde::Serialize;
 use std::collections::HashSet;
 
-use crate::url_policy::{canonical_doc_path, is_indexable_shopify_url};
+use super::url_policy::{canonical_doc_path, is_indexable_shopify_url};
 
 #[derive(Debug)]
 pub(crate) struct MarkdownLink {
