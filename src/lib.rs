@@ -180,31 +180,16 @@ struct IndexConfig {
     enable_on_demand_fetch: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum ToolError {
+    #[error("{message}")]
     Rpc {
         code: i64,
         message: String,
         data: Value,
     },
-    Internal(anyhow::Error),
-}
-
-impl std::fmt::Display for ToolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rpc { message, .. } => write!(f, "{message}"),
-            Self::Internal(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for ToolError {}
-
-impl From<anyhow::Error> for ToolError {
-    fn from(error: anyhow::Error) -> Self {
-        Self::Internal(error)
-    }
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
 }
 
 impl ToolError {
