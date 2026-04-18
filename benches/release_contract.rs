@@ -4,7 +4,7 @@ use std::hint::black_box;
 use std::sync::OnceLock;
 
 #[allow(dead_code, private_interfaces)]
-#[path = "../src/main.rs"]
+#[path = "../src/lib.rs"]
 mod app;
 
 struct Fixture {
