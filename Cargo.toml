@@ -15,7 +15,7 @@ include = [
   "/README.md",
   "/SPEC.md",
   "/benches",
-  "/docs/v0.5-on-demand-fetch.md",
+  "/docs/plans/v0.5-on-demand-fetch.md",
   "/src",
 ]
 
