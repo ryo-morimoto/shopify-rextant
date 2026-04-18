@@ -8,6 +8,7 @@ use tantivy::{Document, Index};
 use super::super::DocRecord;
 use super::super::Paths;
 use super::super::db::docs::{doc_from_row, get_doc};
+use super::super::db::schema::open_db;
 use super::super::util::json::{doc_json_field, escape_query};
 use super::schema::SearchFields;
 use super::tokenizer::{query_needs_japanese_tokenizer, register_japanese_tokenizer};
@@ -73,6 +74,36 @@ impl SearchRuntime {
         }
         Ok(records)
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn search_docs(
+    paths: &Paths,
+    query: &str,
+    version: Option<&str>,
+    limit: usize,
+) -> Result<Vec<DocRecord>> {
+    search_docs_with_runtime(paths, None, query, version, limit)
+}
+
+pub(crate) fn search_docs_with_runtime(
+    paths: &Paths,
+    runtime: Option<&SearchRuntime>,
+    query: &str,
+    version: Option<&str>,
+    limit: usize,
+) -> Result<Vec<DocRecord>> {
+    let conn = open_db(paths)?;
+    if let Some(runtime) = runtime {
+        return runtime.search(&conn, query, version, limit);
+    }
+    if !paths.tantivy.join("meta.json").exists() {
+        return sqlite_like_search(&conn, query, version, limit);
+    }
+    let Some(runtime) = SearchRuntime::open(paths)? else {
+        return sqlite_like_search(&conn, query, version, limit);
+    };
+    runtime.search(&conn, query, version, limit)
 }
 
 pub(crate) fn sqlite_like_search(
