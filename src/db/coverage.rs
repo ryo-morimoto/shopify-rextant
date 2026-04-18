@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-use super::super::CoverageEvent;
+use super::super::domain::coverage::CoverageEvent;
 use super::super::on_demand::FetchCandidate as OnDemandFetchCandidate;
 use super::super::util::time::now_iso;
 

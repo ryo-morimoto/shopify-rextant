@@ -1,14 +1,19 @@
+mod build;
 mod changelog;
 pub mod cli;
+mod config;
+mod coverage;
 mod db;
 mod doc_freshness;
 mod domain;
+mod fetch;
 mod graphql;
 mod map;
 mod markdown;
 mod mcp;
 mod mcp_framing;
 mod on_demand;
+mod refresh;
 mod search;
 mod source;
 mod source_sync;
@@ -18,38 +23,60 @@ mod util;
 
 pub use cli::run;
 
-use changelog::poll::{check_new_versions_from_source, poll_changelog_from_source};
-use db::concepts::{find_concept_by_name, get_concept, insert_concept};
+pub(crate) use build::build_index;
+pub(crate) use changelog::poll::check_new_versions_from_source;
+pub(crate) use config::load_config;
+pub(crate) use coverage::coverage_repair;
+pub(crate) use fetch::shopify_fetch;
+pub(crate) use refresh::refresh;
+pub(crate) use status::{status, versions_available};
+#[cfg(test)]
+pub(crate) use build::build_index_from_sources;
+#[cfg(test)]
+use changelog::poll::poll_changelog_from_source;
+#[cfg(test)]
+use coverage::coverage_repair_from_source;
+#[cfg(test)]
+use fetch::shopify_fetch_from_source;
+#[cfg(test)]
+use refresh::{refresh_stale_docs_from_source, refresh_url_from_source};
+#[cfg(test)]
+use source_sync::store_source_doc;
+
+use db::concepts::{find_concept_by_name, get_concept};
 use doc_freshness::{scheduled_changes_for_concept, staleness, staleness_for_doc};
-use source_sync::{fetch_required_text, fetch_source_doc, store_source_doc};
-pub(crate) use status::{status, update_doc_freshness_states, versions_available};
 #[cfg(test)]
 use status::coverage_status;
-use db::coverage::{
-    failed_coverage_rows, insert_coverage_event, update_coverage_failed, update_coverage_repaired,
-};
-use db::docs::{
-    count_docs, count_where, get_doc, parse_json_string_vec, refresh_indexed_versions,
-    stale_refresh_candidates, upsert_doc,
-};
-use db::graph::{insert_edge, load_edges};
-use db::meta::{get_meta, set_meta};
-use db::schema::{clear_coverage_reports, clear_graph_tables, init_db, open_db};
+#[cfg(test)]
+use db::coverage::insert_coverage_event;
+#[cfg(test)]
+use db::concepts::insert_concept;
+#[cfg(test)]
+use db::docs::{count_docs, refresh_indexed_versions, upsert_doc};
+use db::docs::get_doc;
+#[cfg(test)]
+use db::docs::{count_where, parse_json_string_vec};
+use db::graph::load_edges;
+#[cfg(test)]
+use db::graph::insert_edge;
+#[cfg(test)]
+use db::meta::get_meta;
+use db::schema::{init_db, open_db};
 use domain::concepts::ConceptRecord;
+#[cfg(test)]
 use domain::coverage::CoverageEvent;
 use domain::graph::{GraphEdgeRecord, GraphNodeKey};
 use domain::map::{
     GraphExpansion, MapCenter, MapIndexStatus, MapMeta, MapNode, OnDemandCandidate,
     QueryInterpretation, Staleness,
 };
+#[cfg(test)]
 use domain::source::SourceDoc;
 
 pub(crate) use domain::docs::DocRecord;
-pub(crate) use domain::fetch::FetchResponse;
 pub(crate) use domain::map::MapResponse;
 pub(crate) use domain::source::SourceFetchError;
 pub(crate) use domain::status::StatusResponse;
-use graphql::build::{build_admin_graphql_graph, persist_graph_snapshot};
 #[cfg(test)]
 use graphql::schema_urls::admin_graphql_direct_proxy_url;
 use map::plan::{
@@ -57,11 +84,11 @@ use map::plan::{
     node_kind_rank,
 };
 use map::warnings::{index_age_days, map_coverage_warning};
+#[cfg(test)]
 use markdown::{
-    MarkdownLink, dedupe_links_by_path, extract_sections, parse_markdown_links, parse_sitemap_links,
-    remove_fenced_code_blocks, section_content,
+    extract_sections, parse_markdown_links, parse_sitemap_links, remove_fenced_code_blocks,
+    section_content,
 };
-use url_policy::is_indexable_shopify_url;
 #[cfg(test)]
 use url_policy::{
     canonical_doc_path, classify_api_surface, classify_content_class, classify_doc_type,
@@ -72,35 +99,33 @@ use util::json::merge_json_arrays;
 use util::json::to_json_value;
 use util::time::now_iso;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 #[cfg(test)]
 use chrono::Utc;
 #[cfg(test)]
 use mcp_framing::{read_message as read_mcp_message, write_json as write_mcp_message};
-use on_demand::{
-    FetchCandidate as OnDemandFetchCandidate, FetchPolicy as OnDemandFetchPolicy,
-    is_allowed_path as is_on_demand_allowed_path,
-};
+use on_demand::{FetchCandidate as OnDemandFetchCandidate, FetchPolicy as OnDemandFetchPolicy};
 #[cfg(test)]
 use mcp::daemon::{DaemonIdentity, DaemonPaths};
 use mcp::protocol::json_rpc_error;
 #[cfg(test)]
 use mcp::protocol::handle_mcp_request;
-use search::index_io::{
-    add_tantivy_doc, create_or_reset_index, rebuild_tantivy_from_db, upsert_tantivy_doc,
-};
+#[cfg(test)]
+use search::index_io::rebuild_tantivy_from_db;
 use search::runtime::{SearchRuntime, sqlite_like_search};
-use search::schema::{SearchFields, search_schema};
-use search::tokenizer::register_japanese_tokenizer;
-use source::reqwest_source::ReqwestTextSource;
+#[cfg(test)]
+use search::schema::SearchFields;
+#[allow(unused_imports)]
 pub(crate) use source::text_source::TextSource;
-use rusqlite::{Connection, params};
-use serde::{Deserialize, Serialize};
+use rusqlite::Connection;
+#[cfg(test)]
+use rusqlite::params;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
 use std::fs;
 use std::path::PathBuf;
-use tantivy::doc;
 
 const SHOPIFY_LLMS_URL: &str = "https://shopify.dev/llms.txt";
 const SHOPIFY_SITEMAP_URL: &str = "https://shopify.dev/sitemap.xml";
@@ -176,15 +201,6 @@ pub(crate) struct FetchArgs {
     pub(crate) max_chars: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-struct AppConfig {
-    index: IndexConfig,
-}
-
-#[derive(Debug, Clone)]
-struct IndexConfig {
-    enable_on_demand_fetch: bool,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ToolError {
@@ -210,7 +226,7 @@ impl ToolError {
         }
     }
 
-    fn disabled(candidate: &OnDemandFetchCandidate) -> Self {
+    pub(crate) fn disabled(candidate: &OnDemandFetchCandidate) -> Self {
         Self::Rpc {
             code: -32007,
             message: "On-demand fetch is disabled".to_string(),
@@ -246,10 +262,10 @@ pub(crate) struct SearchArgs {
 
 #[derive(Debug, Clone)]
 pub(crate) struct IndexSourceUrls {
-    llms: String,
-    sitemap: String,
-    changelog: String,
-    versioning: String,
+    pub(crate) llms: String,
+    pub(crate) sitemap: String,
+    pub(crate) changelog: String,
+    pub(crate) versioning: String,
 }
 
 impl Default for IndexSourceUrls {
@@ -285,410 +301,11 @@ impl Paths {
         self.raw.join(raw_path)
     }
 
-    fn config_file(&self) -> PathBuf {
+    pub(crate) fn config_file(&self) -> PathBuf {
         self.home.join("config.toml")
     }
 }
 
-fn load_config(paths: &Paths) -> Result<AppConfig> {
-    let raw = match fs::read_to_string(paths.config_file()) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
-    };
-    let mut section = String::new();
-    let mut enable_on_demand_fetch = false;
-    for line in raw.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            section = line.trim_matches(['[', ']']).trim().to_string();
-            continue;
-        }
-        if section == "index" {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            if key.trim() == "enable_on_demand_fetch" {
-                enable_on_demand_fetch = match value.trim() {
-                    "true" => true,
-                    "false" => false,
-                    other => bail!("invalid enable_on_demand_fetch value: {other}"),
-                };
-            }
-        }
-    }
-    Ok(AppConfig {
-        index: IndexConfig {
-            enable_on_demand_fetch,
-        },
-    })
-}
-
-impl OnDemandFetchPolicy {
-    fn from_config(config: &AppConfig) -> Self {
-        Self::new(config.index.enable_on_demand_fetch)
-    }
-}
-
-fn ensure_on_demand_enabled(
-    policy: &OnDemandFetchPolicy,
-    candidate: &OnDemandFetchCandidate,
-) -> std::result::Result<(), ToolError> {
-    if policy.is_enabled() {
-        Ok(())
-    } else {
-        Err(ToolError::disabled(candidate))
-    }
-}
-
-pub(crate) async fn build_index(paths: &Paths, force: bool, limit: Option<usize>) -> Result<()> {
-    let source = ReqwestTextSource::new()?;
-    build_index_from_sources(paths, force, limit, &IndexSourceUrls::default(), &source).await
-}
-
-pub(crate) async fn build_index_from_sources<S: TextSource>(
-    paths: &Paths,
-    force: bool,
-    limit: Option<usize>,
-    source_urls: &IndexSourceUrls,
-    source: &S,
-) -> Result<()> {
-    if force && paths.data.exists() {
-        fs::remove_dir_all(&paths.data)
-            .with_context(|| format!("remove {}", paths.data.display()))?;
-    }
-    fs::create_dir_all(&paths.raw)?;
-    fs::create_dir_all(&paths.tantivy)?;
-
-    let conn = open_db(paths)?;
-    init_db(&conn, SCHEMA_VERSION)?;
-    let schema = search_schema();
-    let index = create_or_reset_index(paths, schema.clone(), force)?;
-    register_japanese_tokenizer(&index)?;
-    let mut writer = index.writer(50_000_000)?;
-    writer.delete_all_documents()?;
-
-    let llms = fetch_required_text(source, &source_urls.llms).await?;
-    let mut docs = vec![SourceDoc {
-        url: source_urls.llms.clone(),
-        title_hint: Some("Shopify Developer Platform".to_string()),
-        content: llms.clone(),
-        source: "llms".to_string(),
-    }];
-
-    let sitemap = fetch_required_text(source, &source_urls.sitemap).await?;
-    let mut links = parse_markdown_links(&llms);
-    links.extend(parse_sitemap_links(&sitemap));
-    let selected_links = dedupe_links_by_path(links)
-        .into_iter()
-        .filter(|link| is_indexable_shopify_url(&link.url))
-        .take(limit.unwrap_or(usize::MAX));
-
-    let mut coverage_events = Vec::new();
-    for link in selected_links {
-        match fetch_source_doc(source, &link).await {
-            Ok(source) => {
-                coverage_events.push(CoverageEvent::indexed(&link));
-                docs.push(source);
-            }
-            Err(error) => coverage_events.push(CoverageEvent::from_fetch_error(&link, error)),
-        }
-    }
-
-    let graph_build = build_admin_graphql_graph(paths, &docs, source).await?;
-    let fields = SearchFields::from_schema(&schema)?;
-    let tx = conn.unchecked_transaction()?;
-    clear_coverage_reports(&tx)?;
-    clear_graph_tables(&tx)?;
-    let mut indexed_records = Vec::new();
-    for source in &docs {
-        let record = store_source_doc(paths, source)?;
-        upsert_doc(&tx, &record)?;
-        add_tantivy_doc(&mut writer, fields, &record, &source.content)?;
-        indexed_records.push(record);
-    }
-    for event in coverage_events {
-        insert_coverage_event(&tx, &event)?;
-    }
-    for concept in &graph_build.concepts {
-        insert_concept(&tx, concept)?;
-    }
-    for edge in &graph_build.edges {
-        insert_edge(&tx, edge)?;
-    }
-    refresh_indexed_versions(&tx, &indexed_records)?;
-    tx.execute(
-        "INSERT INTO schema_meta(key, value) VALUES('last_sitemap_at', ?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![now_iso()],
-    )?;
-    tx.execute(
-        "INSERT INTO schema_meta(key, value) VALUES('last_full_build', ?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![now_iso()],
-    )?;
-    tx.commit()?;
-    writer.commit()?;
-    if !graph_build.concepts.is_empty() && !graph_build.edges.is_empty() {
-        persist_graph_snapshot(paths, &graph_build)?;
-    }
-    let changelog_report =
-        poll_changelog_from_source(paths, &source_urls.changelog, source).await?;
-    if changelog_report.entries_seen > 0 || !changelog_report.warnings.is_empty() {
-        let conn = open_db(paths)?;
-        set_meta(
-            &conn,
-            "last_changelog_entries_seen",
-            &changelog_report.entries_seen.to_string(),
-        )?;
-        set_meta(
-            &conn,
-            "last_changelog_warning_count",
-            &changelog_report.warnings.len().to_string(),
-        )?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn refresh(paths: &Paths, path: Option<String>, url: Option<String>) -> Result<()> {
-    let source = ReqwestTextSource::new()?;
-    match (path, url) {
-        (Some(_), Some(_)) => bail!("refresh accepts either PATH or --url, not both"),
-        (Some(path), None) => refresh_doc_from_source(paths, &path, &source).await,
-        (None, Some(url)) => refresh_url_from_source(paths, &url, &source).await,
-        (None, None) => refresh_stale_docs_from_source(paths, &source).await,
-    }
-}
-
-async fn refresh_url_from_source<S: TextSource>(
-    paths: &Paths,
-    url: &str,
-    source: &S,
-) -> Result<()> {
-    on_demand_fetch_from_input(paths, url, source)
-        .await
-        .map(|_| ())
-        .map_err(|error| anyhow!(error.to_string()))
-}
-
-#[derive(Debug, Serialize)]
-struct CoverageRepairSummary {
-    attempted: usize,
-    repaired: usize,
-    still_failed: usize,
-    skipped_policy: usize,
-    skipped_disabled: usize,
-}
-
-pub(crate) async fn coverage_repair(paths: &Paths) -> Result<CoverageRepairSummary> {
-    let source = ReqwestTextSource::new()?;
-    coverage_repair_from_source(paths, &source).await
-}
-
-async fn coverage_repair_from_source<S: TextSource>(
-    paths: &Paths,
-    source: &S,
-) -> Result<CoverageRepairSummary> {
-    let conn = open_db(paths)?;
-    init_db(&conn, SCHEMA_VERSION)?;
-    let rows = failed_coverage_rows(&conn)?;
-    let config = load_config(paths)?;
-    let policy = OnDemandFetchPolicy::from_config(&config);
-    let mut summary = CoverageRepairSummary {
-        attempted: 0,
-        repaired: 0,
-        still_failed: 0,
-        skipped_policy: 0,
-        skipped_disabled: 0,
-    };
-    for row in rows {
-        let candidate = match OnDemandFetchPolicy::candidate_from_input(&row.source_url) {
-            Ok(candidate) => candidate,
-            Err(_) => {
-                summary.skipped_policy += 1;
-                continue;
-            }
-        };
-        if !policy.is_enabled() {
-            summary.skipped_disabled += 1;
-            continue;
-        }
-        summary.attempted += 1;
-        match on_demand_fetch_candidate(paths, candidate.clone(), source, false).await {
-            Ok(_) => {
-                update_coverage_repaired(&conn, row.id, &candidate)?;
-                summary.repaired += 1;
-            }
-            Err(error) => {
-                update_coverage_failed(&conn, row.id, &error.to_string())?;
-                summary.still_failed += 1;
-            }
-        }
-    }
-    Ok(summary)
-}
-
-async fn refresh_doc_from_source<S: TextSource>(
-    paths: &Paths,
-    path: &str,
-    source: &S,
-) -> Result<()> {
-    let conn = open_db(paths)?;
-    init_db(&conn, SCHEMA_VERSION)?;
-    let doc = get_doc(&conn, path)?.ok_or_else(|| anyhow!("path not found: {path}"))?;
-    let content = fetch_required_text(source, &doc.url).await?;
-    let source_doc = SourceDoc {
-        url: doc.url,
-        title_hint: Some(doc.title),
-        content,
-        source: doc.source,
-    };
-    let record = store_source_doc(paths, &source_doc)?;
-    upsert_doc(&conn, &record)?;
-    rebuild_tantivy_from_db(paths)?;
-    Ok(())
-}
-
-async fn refresh_stale_docs_from_source<S: TextSource>(paths: &Paths, source: &S) -> Result<()> {
-    let conn = open_db(paths)?;
-    init_db(&conn, SCHEMA_VERSION)?;
-    update_doc_freshness_states(&conn)?;
-    let docs = stale_refresh_candidates(&conn, 100)?;
-    let mut refreshed = 0usize;
-    let mut warnings = Vec::new();
-    for doc in docs {
-        match source.fetch_text(&doc.url).await {
-            Ok(content) => {
-                let source_doc = SourceDoc {
-                    url: doc.url,
-                    title_hint: Some(doc.title),
-                    content,
-                    source: doc.source,
-                };
-                let record = store_source_doc(paths, &source_doc)?;
-                upsert_doc(&conn, &record)?;
-                refreshed += 1;
-            }
-            Err(error) => warnings.push(format!("{}: {}", doc.path, error.reason)),
-        }
-    }
-    set_meta(&conn, "last_aging_sweep_at", &now_iso())?;
-    if !warnings.is_empty() {
-        set_meta(&conn, "last_aging_sweep_warning", &warnings.join("; "))?;
-    }
-    if refreshed > 0 {
-        rebuild_tantivy_from_db(paths)?;
-    }
-    Ok(())
-}
-
-
-pub(crate) async fn shopify_fetch(
-    paths: &Paths,
-    args: &FetchArgs,
-) -> std::result::Result<FetchResponse, ToolError> {
-    let source = ReqwestTextSource::new()?;
-    shopify_fetch_from_source(paths, args, &source).await
-}
-
-async fn shopify_fetch_from_source<S: TextSource>(
-    paths: &Paths,
-    args: &FetchArgs,
-    source: &S,
-) -> std::result::Result<FetchResponse, ToolError> {
-    if let Some(url) = &args.url {
-        let record = on_demand_fetch_from_input(paths, url, source).await?;
-        return fetch_local_doc(paths, &record.path, args).map_err(ToolError::from);
-    }
-    let path = args
-        .path
-        .as_deref()
-        .ok_or_else(|| ToolError::from(anyhow!("shopify_fetch requires path")))?;
-    let conn = open_db(paths)?;
-    init_db(&conn, SCHEMA_VERSION)?;
-    if get_doc(&conn, path)?.is_none() && is_on_demand_allowed_path(path) {
-        let record = on_demand_fetch_from_input(paths, path, source).await?;
-        return fetch_local_doc(paths, &record.path, args).map_err(ToolError::from);
-    }
-    fetch_local_doc(paths, path, args).map_err(ToolError::from)
-}
-
-async fn on_demand_fetch_from_input<S: TextSource>(
-    paths: &Paths,
-    input: &str,
-    source: &S,
-) -> std::result::Result<DocRecord, ToolError> {
-    let candidate = OnDemandFetchPolicy::candidate_from_input(input)
-        .map_err(|_| ToolError::outside_scope(input))?;
-    let config = load_config(paths)?;
-    let policy = OnDemandFetchPolicy::from_config(&config);
-    ensure_on_demand_enabled(&policy, &candidate)?;
-    on_demand_fetch_candidate(paths, candidate, source, true).await
-}
-
-async fn on_demand_fetch_candidate<S: TextSource>(
-    paths: &Paths,
-    candidate: OnDemandFetchCandidate,
-    source: &S,
-    record_coverage: bool,
-) -> std::result::Result<DocRecord, ToolError> {
-    fs::create_dir_all(&paths.raw).map_err(|e| ToolError::from(anyhow!(e)))?;
-    fs::create_dir_all(&paths.tantivy).map_err(|e| ToolError::from(anyhow!(e)))?;
-    let conn = open_db(paths)?;
-    init_db(&conn, SCHEMA_VERSION)?;
-    let link = MarkdownLink {
-        title: candidate.canonical_path.clone(),
-        url: candidate.source_url.clone(),
-        source: "on_demand".to_string(),
-    };
-    let source_doc = fetch_source_doc(source, &link)
-        .await
-        .map_err(|error| ToolError::from(anyhow!("GET {} failed: {}", link.url, error.reason)))?;
-    let content = source_doc.content.clone();
-    let record = store_source_doc(paths, &source_doc)?;
-    upsert_doc(&conn, &record)?;
-    if record_coverage {
-        insert_coverage_event(&conn, &CoverageEvent::indexed(&link))?;
-    }
-    upsert_tantivy_doc(paths, &record, &content)?;
-    Ok(get_doc(&conn, &record.path)?.unwrap_or(record))
-}
-
-fn fetch_local_doc(paths: &Paths, path: &str, args: &FetchArgs) -> Result<FetchResponse> {
-    let conn = open_db(paths)?;
-    let doc = get_doc(&conn, path)?.ok_or_else(|| {
-        let doc_count = count_docs(&conn).unwrap_or(0);
-        anyhow!("path not found: {path}; index_status.doc_count={doc_count}")
-    })?;
-    let mut content = fs::read_to_string(paths.raw_file(&doc.raw_path))?;
-    let sections = extract_sections(&content);
-    if let Some(anchor) = args.anchor.as_deref() {
-        content = section_content(&content, &sections, anchor)
-            .ok_or_else(|| anyhow!("anchor not found: {anchor}"))?;
-    }
-    if args.include_code_blocks == Some(false) {
-        content = remove_fenced_code_blocks(&content);
-    }
-    let max_chars = args.max_chars.unwrap_or(20_000);
-    let truncated = content.chars().count() > max_chars;
-    if truncated {
-        content = content.chars().take(max_chars).collect();
-    }
-    let source_url = doc.url.clone();
-    Ok(FetchResponse {
-        path: doc.path.clone(),
-        title: doc.title.clone(),
-        url: source_url.clone(),
-        source_url,
-        content,
-        sections,
-        truncated,
-        staleness: staleness_for_doc(&conn, &doc)?,
-    })
-}
 
 #[allow(dead_code)]
 pub(crate) fn shopify_map(paths: &Paths, args: &MapArgs) -> Result<MapResponse> {
