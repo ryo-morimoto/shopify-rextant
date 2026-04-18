@@ -1,5 +1,20 @@
+mod markdown;
 mod mcp_framing;
 mod on_demand;
+mod url_policy;
+mod util;
+
+use markdown::{
+    MarkdownLink, SectionInfo, dedupe_links_by_path, extract_sections, parse_markdown_links,
+    parse_sitemap_links, remove_fenced_code_blocks, section_content, title_from_markdown,
+};
+use url_policy::{
+    canonical_doc_path, classify_api_surface, classify_content_class, classify_doc_type,
+    extract_version, is_indexable_shopify_url, raw_doc_candidates, raw_path_for, reading_time_min,
+};
+use util::hash::hex_sha256;
+use util::json::{doc_json_field, escape_query, merge_json_arrays, print_json, to_json_value};
+use util::time::now_iso;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -37,7 +52,6 @@ use tantivy::schema::{
     TextOptions,
 };
 use tantivy::{Document, Index, Term, doc};
-use url::Url;
 
 const SHOPIFY_LLMS_URL: &str = "https://shopify.dev/llms.txt";
 const SHOPIFY_SITEMAP_URL: &str = "https://shopify.dev/sitemap.xml";
@@ -252,14 +266,6 @@ pub(crate) struct FetchResponse {
     sections: Vec<SectionInfo>,
     truncated: bool,
     staleness: Staleness,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SectionInfo {
-    anchor: String,
-    title: String,
-    level: usize,
-    char_range: [usize; 2],
 }
 
 #[derive(Debug, Serialize)]
@@ -2909,13 +2915,6 @@ fn add_tantivy_doc(
 }
 
 #[derive(Debug)]
-struct MarkdownLink {
-    title: String,
-    url: String,
-    source: String,
-}
-
-#[derive(Debug)]
 struct SourceDoc {
     url: String,
     title_hint: Option<String>,
@@ -4234,85 +4233,6 @@ fn insert_unique_edge(
     }
 }
 
-fn parse_markdown_links(markdown: &str) -> Vec<MarkdownLink> {
-    let re = Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").expect("valid regex");
-    re.captures_iter(markdown)
-        .filter_map(|caps| {
-            let title = caps.get(1)?.as_str().trim().to_string();
-            let raw_url = caps.get(2)?.as_str().trim();
-            let url = if raw_url.starts_with("http") {
-                raw_url.to_string()
-            } else if raw_url.starts_with('/') {
-                format!("https://shopify.dev{raw_url}")
-            } else {
-                return None;
-            };
-            Some(MarkdownLink {
-                title,
-                url,
-                source: "llms".to_string(),
-            })
-        })
-        .collect()
-}
-
-fn parse_sitemap_links(xml: &str) -> Vec<MarkdownLink> {
-    let re = Regex::new(r"(?s)<loc>\s*([^<]+?)\s*</loc>").expect("valid regex");
-    re.captures_iter(xml)
-        .filter_map(|caps| {
-            let url = caps.get(1)?.as_str().trim().to_string();
-            if !is_indexable_shopify_url(&url) {
-                return None;
-            }
-            let title = canonical_doc_path(&url).ok()?;
-            Some(MarkdownLink {
-                title,
-                url,
-                source: "sitemap".to_string(),
-            })
-        })
-        .collect()
-}
-
-fn dedupe_links_by_path(links: Vec<MarkdownLink>) -> Vec<MarkdownLink> {
-    let mut seen = HashSet::new();
-    links
-        .into_iter()
-        .filter(|link| {
-            canonical_doc_path(&link.url)
-                .map(|path| seen.insert(path))
-                .unwrap_or(false)
-        })
-        .collect()
-}
-
-fn is_indexable_shopify_url(url: &str) -> bool {
-    Url::parse(url)
-        .ok()
-        .and_then(|url| {
-            let host_ok = matches!(url.host_str(), Some("shopify.dev" | "www.shopify.dev"));
-            let path = url.path();
-            Some(host_ok && (path.starts_with("/docs/") || path.starts_with("/changelog")))
-        })
-        .unwrap_or(false)
-}
-
-fn raw_doc_candidates(url: &str) -> Result<Vec<String>> {
-    let parsed = Url::parse(url)?;
-    let mut base = parsed;
-    base.set_query(None);
-    base.set_fragment(None);
-    let clean = base.to_string().trim_end_matches('/').to_string();
-    let mut candidates = Vec::new();
-    if clean.ends_with(".md") || clean.ends_with(".txt") {
-        candidates.push(clean);
-    } else {
-        candidates.push(format!("{clean}.md"));
-        candidates.push(format!("{clean}.txt"));
-    }
-    Ok(candidates)
-}
-
 fn store_source_doc(paths: &Paths, source: &SourceDoc) -> Result<DocRecord> {
     let path = canonical_doc_path(&source.url)?;
     let title = title_from_markdown(&source.content)
@@ -4345,225 +4265,6 @@ fn store_source_doc(paths: &Paths, source: &SourceDoc) -> Result<DocRecord> {
         raw_path,
         source: source.source.clone(),
     })
-}
-
-fn canonical_doc_path(url: &str) -> Result<String> {
-    let parsed = Url::parse(url)?;
-    let mut path = parsed.path().trim_end_matches('/').to_string();
-    if path.starts_with("/docs/") || path.starts_with("/changelog") {
-        if let Some(stripped) = path.strip_suffix(".md") {
-            path = stripped.to_string();
-        }
-        if let Some(stripped) = path.strip_suffix(".txt") {
-            path = stripped.to_string();
-        }
-    }
-    if path.is_empty() {
-        path = "/".to_string();
-    }
-    Ok(path)
-}
-
-fn raw_path_for(path: &str) -> String {
-    let trimmed = path.trim_start_matches('/');
-    let mut safe = String::new();
-    for ch in trimmed.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.') {
-            safe.push(ch);
-        } else {
-            safe.push('_');
-        }
-    }
-    if safe.is_empty() {
-        "index.md".to_string()
-    } else {
-        format!("{safe}.md")
-    }
-}
-
-fn extract_sections(markdown: &str) -> Vec<SectionInfo> {
-    let mut headings = Vec::new();
-    let mut offset = 0;
-    for line in markdown.split_inclusive('\n') {
-        let line_without_newline = line.trim_end_matches(['\r', '\n']);
-        if let Some((level, title)) = parse_heading(line_without_newline) {
-            headings.push((offset, level, title.to_string()));
-        }
-        offset += line.len();
-    }
-
-    headings
-        .iter()
-        .enumerate()
-        .map(|(index, (start, level, title))| {
-            let end = headings
-                .iter()
-                .skip(index + 1)
-                .find(|(_, next_level, _)| next_level <= level)
-                .map(|(next_start, _, _)| *next_start)
-                .unwrap_or(markdown.len());
-            SectionInfo {
-                anchor: slugify_heading(title),
-                title: title.clone(),
-                level: *level,
-                char_range: [*start, end],
-            }
-        })
-        .collect()
-}
-
-fn parse_heading(line: &str) -> Option<(usize, &str)> {
-    let hashes = line.chars().take_while(|ch| *ch == '#').count();
-    if !(1..=6).contains(&hashes) {
-        return None;
-    }
-    let title = line.get(hashes..)?.strip_prefix(' ')?.trim();
-    if title.is_empty() {
-        None
-    } else {
-        Some((hashes, title))
-    }
-}
-
-fn slugify_heading(title: &str) -> String {
-    let mut slug = String::new();
-    let mut last_dash = false;
-    for ch in title.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            last_dash = false;
-        } else if ch.is_whitespace() || matches!(ch, '-' | '_' | '/') {
-            if !slug.is_empty() && !last_dash {
-                slug.push('-');
-                last_dash = true;
-            }
-        }
-    }
-    slug.trim_matches('-').to_string()
-}
-
-fn section_content(markdown: &str, sections: &[SectionInfo], anchor: &str) -> Option<String> {
-    let normalized = anchor.trim_start_matches('#');
-    sections
-        .iter()
-        .find(|section| section.anchor == normalized)
-        .and_then(|section| markdown.get(section.char_range[0]..section.char_range[1]))
-        .map(ToOwned::to_owned)
-}
-
-fn remove_fenced_code_blocks(markdown: &str) -> String {
-    let mut output = String::new();
-    let mut in_fence = false;
-    let mut fence_marker = "";
-    for line in markdown.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if !in_fence && trimmed.starts_with("```") {
-            in_fence = true;
-            fence_marker = "```";
-            continue;
-        }
-        if !in_fence && trimmed.starts_with("~~~") {
-            in_fence = true;
-            fence_marker = "~~~";
-            continue;
-        }
-        if in_fence && trimmed.starts_with(fence_marker) {
-            in_fence = false;
-            fence_marker = "";
-            continue;
-        }
-        if !in_fence {
-            output.push_str(line);
-        }
-    }
-    output
-}
-
-fn title_from_markdown(markdown: &str) -> Option<String> {
-    markdown.lines().find_map(|line| {
-        line.strip_prefix("# ")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-    })
-}
-
-fn extract_version(path: &str) -> Option<String> {
-    let re = Regex::new(r"20\d{2}-\d{2}|latest").expect("valid regex");
-    re.find(path).map(|m| m.as_str().to_string())
-}
-
-fn classify_doc_type(path: &str) -> String {
-    if path == "/docs/api/admin-graphql"
-        || path == "/docs/api/storefront"
-        || path.contains("/reference")
-        || path.contains("/objects/")
-        || path.contains("/queries/")
-        || path.contains("/mutations/")
-        || path.starts_with("/docs/api/")
-    {
-        "reference"
-    } else if path.contains("/tutorial") || path.contains("/build/") {
-        "tutorial"
-    } else if path.contains("/migrate") || path.contains("/migration") {
-        "migration"
-    } else if path.contains("/guide") || path.contains("/how-to") {
-        "how-to"
-    } else {
-        "explanation"
-    }
-    .to_string()
-}
-
-fn classify_content_class(path: &str) -> String {
-    if path == "/docs/api/admin-graphql" || path == "/docs/api/storefront" {
-        "api_ref"
-    } else if path.contains("/admin-graphql/") || path.contains("/storefront/") {
-        "schema_ref"
-    } else if path.contains("/liquid/") {
-        "liquid_ref"
-    } else if path.contains("/changelog") {
-        "changelog"
-    } else if path.contains("/api/") {
-        "api_ref"
-    } else if path.contains("/tutorial") {
-        "tutorial"
-    } else {
-        "guide"
-    }
-    .to_string()
-}
-
-fn classify_api_surface(path: &str) -> Option<String> {
-    let surface = if path == "/docs/api/admin-graphql" || path.contains("/admin-graphql/") {
-        "admin_graphql"
-    } else if path == "/docs/api/storefront" || path.contains("/storefront/") {
-        "storefront"
-    } else if path.contains("/liquid/") {
-        "liquid"
-    } else if path.contains("/hydrogen/") {
-        "hydrogen"
-    } else if path.contains("/functions/") {
-        "functions"
-    } else if path.contains("/polaris") {
-        "polaris"
-    } else if path.contains("/flow/") {
-        "flow"
-    } else {
-        return None;
-    };
-    Some(surface.to_string())
-}
-
-fn reading_time_min(content: &str) -> i64 {
-    let words = content.split_whitespace().count() as i64;
-    (words / 220).max(1)
-}
-
-fn hex_sha256(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 fn open_db(paths: &Paths) -> Result<Connection> {
@@ -5058,22 +4759,6 @@ fn scheduled_changes_for_refs(conn: &Connection, refs: &[String]) -> Result<Vec<
     Ok(changes)
 }
 
-fn merge_json_arrays(mut left: Vec<Value>, right: Vec<Value>) -> Vec<Value> {
-    let mut seen = left
-        .iter()
-        .filter_map(|value| serde_json::to_string(value).ok())
-        .collect::<HashSet<_>>();
-    for value in right {
-        if serde_json::to_string(&value)
-            .ok()
-            .is_some_and(|key| seen.insert(key))
-        {
-            left.push(value);
-        }
-    }
-    left
-}
-
 #[derive(Clone, Copy)]
 struct SearchFields {
     path: Field,
@@ -5162,44 +4847,6 @@ fn create_or_reset_index(paths: &Paths, schema: Schema, reset: bool) -> Result<I
     } else {
         Index::create_in_dir(&paths.tantivy, schema).map_err(Into::into)
     }
-}
-
-fn doc_json_field(doc_json: &str, field: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(doc_json).ok()?;
-    value.get(field).and_then(|field_value| {
-        field_value
-            .as_array()
-            .and_then(|values| values.first())
-            .and_then(Value::as_str)
-            .or_else(|| field_value.as_str())
-            .map(ToOwned::to_owned)
-    })
-}
-
-fn escape_query(query: &str) -> String {
-    query
-        .chars()
-        .map(|ch| {
-            if ch.is_alphanumeric() || ch.is_whitespace() {
-                ch
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-}
-
-fn to_json_value<T: Serialize>(value: T) -> Value {
-    serde_json::to_value(value).unwrap_or_else(|e| json!({ "serialization_error": e.to_string() }))
-}
-
-fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
-}
-
-fn now_iso() -> String {
-    Utc::now().to_rfc3339()
 }
 
 #[cfg(test)]
