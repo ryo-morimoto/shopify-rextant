@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::super::ConceptRecord;
+use super::super::domain::concepts::ConceptRecord;
 
 pub(crate) fn get_concept(conn: &Connection, id: &str) -> Result<Option<ConceptRecord>> {
     conn.query_row(
