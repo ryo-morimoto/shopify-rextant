@@ -31,6 +31,7 @@ pub(crate) use fetch::shopify_fetch;
 #[allow(unused_imports)]
 pub(crate) use map_runtime::{shopify_map, shopify_map_with_runtime};
 pub(crate) use refresh::refresh;
+pub(crate) use search::runtime::{search_docs, search_docs_with_runtime};
 pub(crate) use status::status;
 #[cfg(test)]
 use config::load_config;
@@ -61,9 +62,8 @@ use db::docs::{count_where, get_doc, parse_json_string_vec};
 use db::graph::insert_edge;
 #[cfg(test)]
 use db::meta::get_meta;
-use db::schema::open_db;
 #[cfg(test)]
-use db::schema::init_db;
+use db::schema::{init_db, open_db};
 #[cfg(test)]
 use domain::concepts::ConceptRecord;
 #[cfg(test)]
@@ -108,7 +108,6 @@ use mcp::protocol::handle_mcp_request;
 use search::index_io::rebuild_tantivy_from_db;
 #[cfg(test)]
 use rusqlite::Connection;
-use search::runtime::{SearchRuntime, sqlite_like_search};
 #[cfg(test)]
 use search::schema::SearchFields;
 #[allow(unused_imports)]
@@ -302,35 +301,6 @@ impl Paths {
 
 
 
-
-pub(crate) fn search_docs(
-    paths: &Paths,
-    query: &str,
-    version: Option<&str>,
-    limit: usize,
-) -> Result<Vec<DocRecord>> {
-    search_docs_with_runtime(paths, None, query, version, limit)
-}
-
-pub(crate) fn search_docs_with_runtime(
-    paths: &Paths,
-    runtime: Option<&SearchRuntime>,
-    query: &str,
-    version: Option<&str>,
-    limit: usize,
-) -> Result<Vec<DocRecord>> {
-    let conn = open_db(paths)?;
-    if let Some(runtime) = runtime {
-        return runtime.search(&conn, query, version, limit);
-    }
-    if !paths.tantivy.join("meta.json").exists() {
-        return sqlite_like_search(&conn, query, version, limit);
-    }
-    let Some(runtime) = SearchRuntime::open(paths)? else {
-        return sqlite_like_search(&conn, query, version, limit);
-    };
-    runtime.search(&conn, query, version, limit)
-}
 
 
 #[cfg(test)]
