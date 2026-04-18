@@ -1,3 +1,6 @@
+mod mcp_framing;
+mod on_demand;
+
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
@@ -6,6 +9,11 @@ use lindera::dictionary::load_dictionary;
 use lindera::mode::Mode;
 use lindera::segmenter::Segmenter;
 use lindera_tantivy::tokenizer::LinderaTokenizer;
+use mcp_framing::{read_message as read_mcp_message, write_json as write_mcp_message};
+use on_demand::{
+    FetchCandidate as OnDemandFetchCandidate, FetchPolicy as OnDemandFetchPolicy,
+    is_allowed_path as is_on_demand_allowed_path,
+};
 use regex::Regex;
 use reqwest::StatusCode;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -14,7 +22,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -370,22 +378,6 @@ struct IndexConfig {
     enable_on_demand_fetch: bool,
 }
 
-#[derive(Debug, Clone)]
-struct OnDemandFetchPolicy {
-    enable_on_demand_fetch: bool,
-}
-
-#[derive(Debug, Clone)]
-struct OnDemandFetchCandidate {
-    canonical_path: String,
-    source_url: String,
-}
-
-#[derive(Debug)]
-enum OnDemandPolicyError {
-    OutsideScope,
-}
-
 #[derive(Debug)]
 pub(crate) enum ToolError {
     Rpc {
@@ -689,79 +681,19 @@ fn load_config(paths: &Paths) -> Result<AppConfig> {
 
 impl OnDemandFetchPolicy {
     fn from_config(config: &AppConfig) -> Self {
-        Self {
-            enable_on_demand_fetch: config.index.enable_on_demand_fetch,
-        }
-    }
-
-    fn candidate_from_input(
-        input: &str,
-    ) -> std::result::Result<OnDemandFetchCandidate, OnDemandPolicyError> {
-        if input.starts_with('/') {
-            return Self::candidate_from_path(input);
-        }
-        Self::candidate_from_url(input)
-    }
-
-    fn check_enabled(
-        &self,
-        candidate: &OnDemandFetchCandidate,
-    ) -> std::result::Result<(), ToolError> {
-        if self.enable_on_demand_fetch {
-            Ok(())
-        } else {
-            Err(ToolError::disabled(candidate))
-        }
-    }
-
-    fn candidate_from_url(
-        input: &str,
-    ) -> std::result::Result<OnDemandFetchCandidate, OnDemandPolicyError> {
-        let parsed = Url::parse(input).map_err(|_| OnDemandPolicyError::OutsideScope)?;
-        let host_ok = parsed.host_str() == Some("shopify.dev");
-        if parsed.scheme() != "https" || !host_ok || !is_on_demand_allowed_path(parsed.path()) {
-            return Err(OnDemandPolicyError::OutsideScope);
-        }
-        let canonical_path = normalize_docs_path(parsed.path());
-        Ok(OnDemandFetchCandidate {
-            source_url: format!("https://shopify.dev{canonical_path}"),
-            canonical_path,
-        })
-    }
-
-    fn candidate_from_path(
-        input: &str,
-    ) -> std::result::Result<OnDemandFetchCandidate, OnDemandPolicyError> {
-        if !is_on_demand_allowed_path(input) {
-            return Err(OnDemandPolicyError::OutsideScope);
-        }
-        let canonical_path = normalize_docs_path(input);
-        Ok(OnDemandFetchCandidate {
-            source_url: format!("https://shopify.dev{canonical_path}"),
-            canonical_path,
-        })
+        Self::new(config.index.enable_on_demand_fetch)
     }
 }
 
-fn normalize_docs_path(path: &str) -> String {
-    let mut path = path
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(path)
-        .trim()
-        .to_string();
-    path = path.trim_end_matches('/').to_string();
-    if let Some(stripped) = path.strip_suffix(".md") {
-        path = stripped.to_string();
+fn ensure_on_demand_enabled(
+    policy: &OnDemandFetchPolicy,
+    candidate: &OnDemandFetchCandidate,
+) -> std::result::Result<(), ToolError> {
+    if policy.is_enabled() {
+        Ok(())
+    } else {
+        Err(ToolError::disabled(candidate))
     }
-    if let Some(stripped) = path.strip_suffix(".txt") {
-        path = stripped.to_string();
-    }
-    path
-}
-
-fn is_on_demand_allowed_path(path: &str) -> bool {
-    path.starts_with("/docs/") || path.starts_with("/changelog/")
 }
 
 async fn build_index(paths: &Paths, force: bool, limit: Option<usize>) -> Result<()> {
@@ -938,7 +870,7 @@ async fn coverage_repair_from_source<S: TextSource>(
                 continue;
             }
         };
-        if policy.check_enabled(&candidate).is_err() {
+        if !policy.is_enabled() {
             summary.skipped_disabled += 1;
             continue;
         }
@@ -1726,48 +1658,6 @@ fn tool_descriptors() -> Vec<Value> {
     ]
 }
 
-fn read_mcp_message<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>> {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            return Ok(None);
-        }
-
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            let len = value.trim().parse::<usize>()?;
-            loop {
-                line.clear();
-                let bytes = reader.read_line(&mut line)?;
-                if bytes == 0 {
-                    bail!("unexpected EOF before MCP message body");
-                }
-                if line.trim_end_matches(['\r', '\n']).is_empty() {
-                    break;
-                }
-            }
-            let mut body = vec![0; len];
-            reader.read_exact(&mut body)?;
-            return Ok(Some(body));
-        }
-
-        return Ok(Some(trimmed.as_bytes().to_vec()));
-    }
-}
-
-fn write_mcp_message<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
-    serde_json::to_writer(&mut *writer, value)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    Ok(())
-}
-
 fn json_rpc_error(code: i64, message: &str, data: Value) -> Value {
     json!({ "code": code, "message": message, "data": data })
 }
@@ -1811,7 +1701,7 @@ async fn on_demand_fetch_from_input<S: TextSource>(
         .map_err(|_| ToolError::outside_scope(input))?;
     let config = load_config(paths)?;
     let policy = OnDemandFetchPolicy::from_config(&config);
-    policy.check_enabled(&candidate)?;
+    ensure_on_demand_enabled(&policy, &candidate)?;
     on_demand_fetch_candidate(paths, candidate, source, true).await
 }
 
