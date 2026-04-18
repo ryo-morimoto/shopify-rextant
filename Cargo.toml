@@ -9,20 +9,11 @@ repository = "https://github.com/ryo-morimoto/shopify-rextant"
 keywords = ["shopify", "mcp", "docs", "search", "cli"]
 categories = ["command-line-utilities"]
 include = [
-  "/Cargo.lock",
-  "/Cargo.toml",
   "/LICENSE",
   "/README.md",
-  "/SPEC.md",
   "/benches",
-  "/docs/plans/v0.5-on-demand-fetch.md",
   "/src",
 ]
-
-[[bin]]
-name = "shopify-rextant"
-path = "src/main.rs"
-bench = false
 
 [[bench]]
 name = "release_contract"
