@@ -1,9 +1,9 @@
 # shopify-rextant — Design Document
 
-**Status**: v0.1 implemented / v0.1.1 target
+**Status**: v0.5.0 implementation complete / release-prep pending
 **Author**: Maintainers
-**Last updated**: 2026-04-17
-**Version**: 0.1.1 (target)
+**Last updated**: 2026-04-18
+**Version**: 0.5.0 release candidate (SPEC)
 
 ---
 
@@ -15,7 +15,22 @@ Shopifyアプリ開発中のcoding agentが、shopify.devへの毎回のHTTP fet
 
 **実装言語**: Rust。Node.jsでは並列性・検索エンジン(tantivy)・メモリフットプリントで限界があるため。
 
-**配布**: 単一バイナリ。`cargo install shopify-rextant` / Homebrew / GitHub Releases。
+**配布**: 現時点はsource checkoutからのlocal install/buildを正とする。crates.io / Homebrew / GitHub Releases / NixOS flakeはv1.0公開準備項目。
+
+**現在の実装スナップショット**:
+
+- v0.1: local MCP server、newline-delimited JSON stdio、`shopify_map` / `shopify_fetch` / `shopify_status`
+- v0.1.1-v0.1.2: sitemap discovery、coverage reporting、fetch section extraction、transport fixtures
+- v0.2: Admin GraphQL concept/doc graph foundation
+- v0.3: changelog freshness and scheduled change hydration
+- v0.4: Japanese tokenizer integration; edge repair and diagnostics remain roadmap work
+- v0.5: on-demand official docs fetch, `refresh --url`, and `coverage repair`
+
+**リリース準備メモ**:
+
+- このSPECはv0.5.0相当の実装契約を記録する。公開リリースは、package metadata、README/CONTRIBUTING、CI/release workflow、配布チャネルが揃った時点で切る
+- `Cargo.toml` の package version はリリースタグ直前に意図した公開バージョンへ上げる。`USER_AGENT` とCLI `--version` は `CARGO_PKG_VERSION` に従う
+- それまでは `cargo install --path .` / `cargo build --release` と `cargo test` をrelease candidate検証の正とする
 
 ---
 
@@ -251,7 +266,7 @@ CREATE INDEX idx_coverage_path ON coverage_reports(canonical_path);
 -- Concept グラフ(型・API・機能)
 CREATE TABLE concepts (
   id                TEXT PRIMARY KEY,           -- "admin_graphql.2026-04.Product" 等の一意ID
-  kind              TEXT NOT NULL,              -- "graphql_type" | "graphql_mutation" | "graphql_query" | "liquid_object" | "function_api" | "polaris_component" | "webhook_topic" | ...
+  kind              TEXT NOT NULL,              -- "graphql_type" | "graphql_field" | "graphql_input_object" | "graphql_enum" | "graphql_interface" | "graphql_union" | "graphql_scalar" | "graphql_mutation" | "graphql_query" | "liquid_object" | "function_api" | "polaris_component" | "webhook_topic" | ...
   name              TEXT NOT NULL,              -- "Product", "productCreate", "cart.line_items"
   version           TEXT,
   defined_in_path   TEXT,                       -- docs.pathへの参照
@@ -271,7 +286,7 @@ CREATE TABLE edges (
   from_id           TEXT NOT NULL,
   to_type           TEXT NOT NULL,
   to_id             TEXT NOT NULL,
-  kind              TEXT NOT NULL,              -- "defined_in" | "used_in" | "see_also" | "parent_of" | "next" | "prev" | "replaces" | "teaches" | "requires" | "composed_of" | "references_type"
+  kind              TEXT NOT NULL,              -- "defined_in" | "used_in" | "see_also" | "parent_of" | "next" | "prev" | "replaces" | "teaches" | "requires" | "composed_of" | "has_field" | "returns" | "accepts_input" | "implements" | "member_of" | "references_type"
   weight            REAL NOT NULL DEFAULT 1.0,  -- BFS時の重み
   source_path       TEXT,                       -- このエッジを抽出した元ドキュメント
   extracted_at      TEXT NOT NULL
@@ -297,7 +312,8 @@ CREATE TABLE changelog_entries (
   body              TEXT,
   url               TEXT NOT NULL,
   is_breaking       INTEGER NOT NULL DEFAULT 0,
-  affected_types    TEXT,                       -- JSON: ["DraftOrderLineItem.grams", ...]
+  affected_types    TEXT,                       -- JSON: concepts/docsで解決済みの参照 ["admin_graphql.2026-04.DraftOrderLineItem.grams", ...]
+  unresolved_affected_refs TEXT,                -- JSON: changelogから抽出したがindex上で未解決の候補 ["UnknownType.foo", ...]
   affected_surfaces TEXT,                       -- JSON: ["admin_graphql", ...]
   processed_at      TEXT
 );
@@ -414,7 +430,8 @@ pub struct EdgeData {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EdgeKind {
     DefinedIn, UsedIn, SeeAlso, ParentOf, Next, Prev,
-    Replaces, Teaches, Requires, ComposedOf, ReferencesType,
+    Replaces, Teaches, Requires, ComposedOf,
+    HasField, Returns, AcceptsInput, Implements, MemberOf, ReferencesType,
 }
 ```
 
@@ -535,9 +552,10 @@ interface MapResponse {
       skipped_count?: number;
       failed_count?: number;
     };
-    on_demand_candidate?: {           // v0.5以降。0件時の回収候補
+    on_demand_candidate?: {           // v0.5.0。0件時の回収候補
       url: string;
       enabled: boolean;
+      reason: string;
     };
     query_interpretation: {          // 入力をどう解釈したか(デバッグ用)
       resolved_as: "concept_name" | "doc_path" | "task_name" | "free_text";
@@ -577,13 +595,23 @@ interface MapResponse {
    - rank順にsort → 同rank内はconceptの依存順でトポソート(型Aが型Bを参照するならA→B)
 7. JSON serialize
 
-**v0.1.1 UX guardrails:**
+**Map UX guardrails (implemented baseline):**
 
 - `nodes` は `path` で安定dedupeする
 - `center` は最高scoreのdocだが、`meta.query_interpretation.entry_points` に上位候補を全て残す
 - `query_plan` は「次に `shopify_fetch` すべきpath」を短く返す。検索語の言い換えや自然文回答はしない
 - 検索結果0件なら、`index_status.doc_count` と `coverage_warning` を返し、v0.5のオンデマンド回収が使える場合はその候補URLを示す
-- v0.1.1では `edges=[]` が正常。v0.2以降はedgesが空ならcoverage/graph構築の警告を出す
+- graphが使えない場合は `edges=[]`、`meta.graph_available=false`、coverage/graph warningを返し、FTS導線にfallbackする
+
+**v0.2.0 graph contract:**
+
+- `meta.graph_available=true` は、少なくとも対象APIバージョンのAdmin GraphQL schemaから `concepts` と `edges` を構築し、`shopify_map` がpetgraph BFSで展開している時だけ返す
+- `concept_name` 起点で `concepts.name` が複数バージョンに存在する場合、`version`引数 > `config.toml`の`pinned_version` > latest stable の順で1バージョンに解決する
+- `free_text` 起点はbaseline FTS top-kを使うが、返されたdoc pathを `defined_in` / `references_type` edgeでconcept起点へ昇格してからBFSする。昇格できないdocはdocノードとして残す
+- `edges` はレスポンスに含めた `nodes[].id` 間のedgeだけを返す。レスポンス外ノードへのedgeは返さない
+- `suggested_reading_order` はdoc pathだけを含める。concept/taskノードは読む対象ではないため、対応する `defined_in` doc pathがある場合だけorderに入る
+- concept hitで `edges=[]` になる場合、`query_plan[0].action="inspect_status"` とし、`meta.coverage_warning` にgraph構築失敗またはschema coverage不足を明示する
+- v0.2.0はAdmin GraphQL graphを最小対象とする。Storefront GraphQL、Liquid、Functions、Polarisのconcept抽出は既存doc/FTS導線を維持し、同じgraph基盤へ後続追加する
 
 ### 5.2 `shopify_fetch`
 
@@ -609,7 +637,7 @@ interface MapResponse {
     },
     "url": {
       "type": "string",
-      "description": "v0.5以降。shopify.dev/docs配下のURL。未収録docをオンデマンド取得する時だけ使う"
+      "description": "v0.5.0。shopify.dev/docs または shopify.dev/changelog 配下のURL。未収録docをオンデマンド取得する時だけ使う"
     },
     "include_code_blocks": {
       "type": "boolean",
@@ -644,17 +672,20 @@ interface FetchResponse {
 }
 ```
 
-**v0.1.1 behavior:**
+**Indexed path behavior:**
 
 - `path` は既存index内の正規pathだけを受け付ける
 - `anchor` 指定時は、該当headingから次の同階層以上のheading直前までの原文Markdownを返す
 - `include_code_blocks=false` の時だけ fenced code block を除外できる。ただしデフォルトは原文忠実性を優先して `true`
 - path未検出時は `Path not found` と `index_status.doc_count` を返す。ネットワーク取得はしない
 
-**v0.5 behavior:**
+**On-demand behavior (v0.5 implemented):**
 
 - `url` または未収録のshopify.dev docs pathを受け取った場合、設定で許可されていればオンデマンドfetchしてraw保存、docs upsert、tantivy差分投入を行う
 - オンデマンド取得は `shopify.dev` の `/docs/**` と `/changelog/**` のみに制限する。任意URL fetchにはしない
+- `[index].enable_on_demand_fetch=false` の場合、HTTP requestを送らず `-32007` と候補URLを返す
+- URL scope違反の場合、HTTP requestを送らず `-32008` を返す
+- newly recovered docs は `source="on_demand"` として保存する。既存の `llms` / `sitemap` 由来docをon-demandでrefreshしてもsourceはdowngradeしない
 
 **処理**: `docs.raw_path`を引いて`data/raw/`下のファイルをmmapで読み、anchor指定があればmarkdown parser(例: `pulldown-cmark`)でセクション抽出。
 
@@ -668,12 +699,15 @@ interface FetchResponse {
 
 ```typescript
 interface StatusResponse {
+  schema_version: string;
+  data_dir: string;
+  index_built: boolean;
+  doc_count: number;
+  last_full_build?: string;       // ISO8601
   index: {
-    last_full_build: string;      // ISO8601
-    age_days: number;
-    doc_count: number;
     concept_count: number;
     edge_count: number;
+    graph_snapshot: boolean;
   };
   coverage: {
     last_sitemap_at?: string;      // ISO8601
@@ -689,26 +723,21 @@ interface StatusResponse {
       manual: number;
     };
   };
-  freshness_distribution: {
-    fresh: number;
-    aging: number;
-    stale: number;
-  };
-  versions: {
-    available: string[];
-    latest_stable: string;
-    release_candidate?: string;
-    pinned: string | null;        // config.tomlでpin中のバージョン
+  freshness: {
+    fresh_count: number;
+    aging_count: number;
+    stale_count: number;
   };
   workers: {
-    version_watcher_last_run: string;
-    changelog_watcher_last_run: string;
-    aging_sweeper_last_run: string;
-    pending_rebuilds: number;
+    last_changelog_at?: string;
+    last_aging_sweep_at?: string;
+    last_version_check_at?: string;
   };
-  transport: {
-    protocol: "newline_json" | "content_length";
-    initialize_p50_ms?: number;
+  changelog: {
+    entry_count: number;
+    scheduled_change_count: number;
+    unresolved_ref_count: number;
+    last_warning?: string;
   };
   warnings: string[];             // 例: "Changelog not polled for 2 days; network may be unavailable"
 }
@@ -737,10 +766,15 @@ Phase 2: Content fetch (並列、concurrency=8)
   7. content_shaを計算して docs テーブルへupsert
   8. タイトル抽出(最初の # 行)、frontmatter title fallback、reading_time_min推定
 
-Phase 3: Schema snapshots
-  9. GET https://shopify.dev/admin-graphql-direct-proxy/{version} (全indexed_versions)
-     - SDLまたはJSON introspection 保存
-  10. SDLをパースして concepts / edges(GraphQL型間) をbulk insert
+Phase 3: Admin GraphQL schema snapshots (v0.2.0)
+  9. POST https://shopify.dev/admin-graphql-direct-proxy/{version} (全indexed_versions)
+     - GraphQL introspection queryを送る。認証済みストアのAdmin API endpointは使わない
+     - fields/inputFields/enumValues は deprecated を含めて取得する
+     - data/schemas/admin-graphql/{version}.introspection.json に保存する
+  10. introspection JSONをパースして concepts / edges(GraphQL型間) をbulk insert
+     - Object/InputObject/Interface/Union/Enum/Scalar をconcept化する
+     - field/input field/enum valueは親concept配下のconceptとして保持する
+     - `defined_in`, `has_field`, `returns`, `accepts_input`, `implements`, `member_of`, `references_type` edgeを作る
 
 Phase 4: Extract edges from guides
   11. 各guide/tutorialのmarkdownをパース
@@ -834,46 +868,61 @@ fn infer_doc_type(path: &str) -> DocType {
 
 70-80%の精度で十分。query_logから漏れを発見して月次でrule追加。
 
-### 6.3 GraphQL SDLからのconcept/edge抽出
+### 6.3 GraphQL introspectionからのconcept/edge抽出
+
+v0.2.0はAdmin GraphQL schema direct proxyからGraphQL introspection JSONを取得してconcept graphを作る。公式のGraphQL codegen設定が `schema: 'https://shopify.dev/admin-graphql-direct-proxy/{version}'` を使うため、このURLをschema sourceとして扱う。ライブストアのAdmin API endpointは認証が必要なので、このツールのlocal docs index構築には使わない。
 
 ```rust
 // 擬似コード
-let schema_sdl = fs::read_to_string("schemas/admin-2026-04.graphql")?;
-let doc = graphql_parser::parse_schema::<String>(&schema_sdl)?;
+let schema = read_introspection_json("data/schemas/admin-graphql/2026-04.introspection.json")?;
 
-for definition in doc.definitions {
-    match definition {
-        ObjectType(obj) => {
-            let concept_id = format!("admin_graphql.2026-04.{}", obj.name);
+for ty in schema.types {
+    match ty.kind {
+        TypeKind::Object => {
+            let concept_id = format!("admin_graphql.2026-04.{}", ty.name);
             insert_concept(&conn, Concept {
                 id: concept_id.clone(),
                 kind: "graphql_type".to_string(),
-                name: obj.name,
+                name: ty.name,
                 version: Some("2026-04".to_string()),
-                defined_in_path: Some(format!("/docs/api/admin-graphql/2026-04/objects/{}", obj.name)),
-                deprecated: obj.directives.iter().any(|d| d.name == "deprecated"),
+                defined_in_path: doc_path_for_graphql_type("2026-04", &ty.name),
+                deprecated: false,
                 ...
             });
 
-            for field in obj.fields {
+            if let Some(path) = doc_path_for_graphql_type("2026-04", &ty.name) {
+                insert_edge(&conn, Edge {
+                    from_type: "concept", from_id: &concept_id,
+                    to_type: "doc", to_id: &path,
+                    kind: "defined_in",
+                });
+            }
+
+            for field in ty.fields {
                 let field_concept_id = format!("{}.{}", concept_id, field.name);
-                insert_concept(&conn, Concept { kind: "graphql_field", ... });
+                insert_concept(&conn, Concept {
+                    id: field_concept_id.clone(),
+                    kind: "graphql_field".to_string(),
+                    name: format!("{}.{}", ty.name, field.name),
+                    deprecated: field.is_deprecated,
+                    deprecation_reason: field.deprecation_reason,
+                    ...
+                });
                 insert_edge(&conn, Edge {
                     from: &concept_id, to: &field_concept_id,
                     kind: "has_field",
                 });
 
-                // フィールドの戻り値型を参照エッジとして追加
-                if let Some(target_type) = extract_type_name(&field.field_type) {
+                if let Some(target_type) = named_type(&field.type_ref) {
                     insert_edge(&conn, Edge {
                         from: &field_concept_id,
                         to: &format!("admin_graphql.2026-04.{}", target_type),
-                        kind: "references_type",
+                        kind: "returns",
                     });
                 }
             }
         },
-        // InputObjectType, InterfaceType, UnionType, EnumType, ScalarType 同様
+        // InputObject, Interface, Union, Enum, Scalar 同様
         _ => ()
     }
 }
@@ -982,31 +1031,39 @@ async fn poll_changelog(app: &AppState) -> Result<()> {
     for entry in parsed.entries {
         if app.has_changelog_entry(&entry.id).await? { continue; }
 
-        // 4. 影響範囲推定(正規表現ベース)
-        let affected_types = extract_affected_types(&entry.title, &entry.content);
+        // 4. 影響範囲候補を推定(正規表現ベース)
+        let affected_candidates = extract_affected_refs(&entry.title, &entry.content);
+        // 5. schema/doc indexをSSoTとして解決できた候補だけを採用する
+        let impact = resolve_changelog_impact(&app, affected_candidates).await?;
         let is_breaking = entry.categories.iter().any(|c| c.term == "breaking")
             || entry.title.contains("removed")
             || entry.title.contains("breaking");
 
-        // 5. changelog_entriesに挿入
+        // 6. changelog_entriesに挿入
         app.insert_changelog_entry(ChangelogEntry {
-            id: entry.id, title: entry.title, ... is_breaking, affected_types: affected_types.clone(),
+            id: entry.id,
+            title: entry.title,
+            ...
+            is_breaking,
+            affected_types: impact.resolved_refs.clone(),
+            unresolved_affected_refs: impact.unresolved_refs.clone(),
         }).await?;
 
-        // 6. scheduled_changesを抽出(「XXが2026-07で削除」のようなパターン)
+        // 7. scheduled_changesを抽出(「XXが2026-07で削除」のようなパターン)
+        //    ただしtype_nameはresolved_refsに含まれるconcept/docだけを採用する
         if let Some(sc) = extract_scheduled_change(&entry) {
             app.insert_scheduled_change(sc).await?;
         }
 
-        // 7. 影響を受けるdocsにreferences_deprecated フラグ立て
-        for ty in &affected_types {
-            app.mark_docs_referencing(ty).await?;
+        // 8. 影響を受けるdocsにreferences_deprecated フラグ立て
+        for resolved_ref in &impact.resolved_refs {
+            app.mark_docs_referencing(resolved_ref).await?;
         }
 
-        // 8. breaking changeなら該当docを即座に再fetch
+        // 9. breaking changeなら該当docを即座に再fetch
         if is_breaking {
-            for ty in &affected_types {
-                for path in app.docs_referencing_type(ty).await? {
+            for resolved_ref in &impact.resolved_refs {
+                for path in app.docs_referencing_type(resolved_ref).await? {
                     app.enqueue_doc_refresh(&path, Priority::High).await?;
                 }
             }
@@ -1089,6 +1146,14 @@ async fn repair_edges(app: &AppState) -> Result<()> {
     Ok(())
 }
 ```
+
+**Changelog impact resolution contract (v0.3.0):**
+
+- changelog watcherは、title/body/link/categoriesから `Type.field`、GraphQL type名、API version、docs URL/path、API surface category などの候補を正規表現で抽出する。
+- 抽出候補はそのまま真として扱わない。impactのSSoTは `concepts` / `docs` / `edges` とし、index上で解決できた候補だけを `affected_types` と `scheduled_changes.type_name` に採用する。
+- `concepts.id` に解決できる候補はconcept impact、`docs.path` に解決できる候補はdoc impactとして扱う。doc impactからconceptへ到達できる場合は `edges` 経由で関連concept/docsも影響範囲に含める。
+- index上で解決できない候補は `unresolved_affected_refs` に保存するが、`references_deprecated` や `upcoming_changes` には反映しない。
+- `affected_surfaces` はRSS categoryと解決済みconcept/docの `api_surface` から導出する。changelog本文だけでsurfaceを確定しない。
 
 ---
 
@@ -1273,13 +1338,16 @@ async fn rebuild_graph(app: &AppState) -> Result<()> {
 shopify-rextant serve
     # MCP stdio server開始。起動時にbackground workersもspawn
     
-shopify-rextant build [--force] [--version 2026-04,2026-07]
-    # インデックス構築。--forceで既存削除、--versionで特定バージョンのみ
+shopify-rextant build [--force] [--limit N]
+    # インデックス構築。--forceで既存削除、--limitで取り込み件数を制限
     
 shopify-rextant refresh [PATH]
     # PATHが指定されればそのドキュメントだけconditional refetch
     # 未指定なら aging_sweeper を即時実行
-    # v0.5以降: --url https://shopify.dev/docs/... で未収録docをオンデマンド取得
+    # v0.5.0: --url https://shopify.dev/docs/... で未収録docをオンデマンド取得
+
+shopify-rextant coverage repair
+    # v0.5.0: coverage_reports.status="failed" の許可済み公式docs/changelog URLを再試行
     
 shopify-rextant status
     # shopify_status ツールと同じ情報をterminalに表示
@@ -1292,14 +1360,15 @@ shopify-rextant show PATH
     # 指定pathの生markdownをterminalに表示
     # --anchor でセクション切り出し
     
-shopify-rextant graph --from CONCEPT [--radius 2] [--format mermaid|dot|json]
-    # shopify_map ツールと同じ結果を人間可読フォーマットで(デバッグ用)
-    
-shopify-rextant changelog [--since 2026-04-01]
-    # 取り込み済みchangelogエントリ一覧
-    
 shopify-rextant version
     # バイナリバージョン、index schema version、データサイズ表示
+```
+
+Planned CLI, not currently implemented:
+
+```bash
+shopify-rextant graph --from CONCEPT [--radius 2] [--format mermaid|dot|json]
+shopify-rextant changelog [--since 2026-04-01]
 ```
 
 ### 10.2 設定ファイル `~/.shopify-rextant/config.toml`
@@ -1314,7 +1383,7 @@ pinned_version = "2026-04"
 enable_task_extraction = true
 # sitemap.xmlから/docs/**を取り込むか。v0.1.1以降はtrue推奨
 enable_sitemap_discovery = true
-# v0.5以降。未収録shopify.dev/docs URLをfetch時に取得してindexへ追加するか
+# v0.5.0。未収録shopify.dev/docs URLをfetch時に取得してindexへ追加するか
 enable_on_demand_fetch = false
 
 [workers]
@@ -1324,7 +1393,7 @@ aging_sweeper_interval_hours = 6
 edge_repairer_interval_hours = 72
 
 [network]
-user_agent = "shopify-rextant/0.1.1"
+user_agent = "shopify-rextant/<binary version>"
 request_timeout_seconds = 30
 # 並列fetch数
 concurrency = 8
@@ -1354,28 +1423,40 @@ enable_japanese = true
 
 ### 11.1 配布経路
 
-**Tier 1(推奨)**: cargo
+**現在のpre-release導入**: source checkout
+```bash
+cargo install --path .
+```
+
+または:
+
+```bash
+cargo build --release
+./target/release/shopify-rextant version
+```
+
+**Planned Tier 1(推奨)**: crates.io
 ```bash
 cargo install shopify-rextant
 ```
 
-**Tier 2**: Homebrew (macOS/Linux)
+**Planned Tier 2**: Homebrew (macOS/Linux)
 ```bash
 brew install shopify-rextant/tap/shopify-rextant
 ```
 
-**Tier 3**: 事前ビルド済みバイナリ
+**Planned Tier 3**: 事前ビルド済みバイナリ
 ```bash
 # GitHub Releasesから
-curl -L https://github.com/shopify-rextant/shopify-rextant/releases/latest/download/shopify-rextant-$(uname -s | tr A-Z a-z)-$(uname -m) -o ~/.local/bin/shopify-rextant
+curl -L https://github.com/<owner>/shopify-rextant/releases/latest/download/shopify-rextant-$(uname -s | tr A-Z a-z)-$(uname -m) -o ~/.local/bin/shopify-rextant
 chmod +x ~/.local/bin/shopify-rextant
 ```
 
-**Tier 4**: NixOS flake
+**Planned Tier 4**: NixOS flake
 ```nix
 # flake.nix
 {
-  inputs.shopify-rextant.url = "github:shopify-rextant/shopify-rextant";
+  inputs.shopify-rextant.url = "github:<owner>/shopify-rextant";
   # ...
   home.packages = [ shopify-rextant.packages.${system}.default ];
 }
@@ -1384,8 +1465,8 @@ chmod +x ~/.local/bin/shopify-rextant
 ### 11.2 初回セットアップ
 
 ```bash
-# 1. インストール
-cargo install shopify-rextant
+# 1. pre-release source install
+cargo install --path .
 
 # 2. インデックス構築(2-5分)
 shopify-rextant build
@@ -1420,7 +1501,28 @@ command = "shopify-rextant"
 args = ["serve"]
 ```
 
-### 11.4 サイズ見積もり
+### 11.4 共有daemon runtime
+
+`shopify-rextant serve` はMCP stdio entrypointのまま維持する。通常は軽量shimとして起動し、同一identityのlocal daemonへUnix domain socketで接続する。daemonは1つの warmed `ServerState`、Tantivy reader、Japanese tokenizer cache、background worker setを保持するため、global MCP登録とproject-level MCP登録が同じidentityならruntimeを共有できる。
+
+互換性・調査用に direct mode を残す:
+
+```bash
+shopify-rextant serve --direct
+```
+
+Direct mode は現行の単一プロセスstdio serverとして動作し、newline-delimited JSON と Content-Length framing の両方を受け付ける。MCP transportの切り分け、daemonのstale socket調査、ベンチマークbaselineでは direct mode を使う。
+
+Daemon identity は保守的に計算する:
+
+- canonical `--home`
+- package version
+- index `SCHEMA_VERSION`
+- `config.toml` hash
+
+identity hashから `/tmp/shopify-rextant-daemons/*.sock`、`*.lock`、`*.pid` を作る。socket filenameはhash化してUnix socket path lengthを抑える。socketが応答しない、pidだけ残っている、lockが古い場合はshimが起動時にstale artifactとして回収する。stdoutはshimでもdaemonでもMCP JSON-RPC message専用で、診断ログはstderrに出す。
+
+### 11.5 サイズ見積もり
 
 | 項目 | 概算 |
 |---|---|
@@ -1443,8 +1545,9 @@ args = ["serve"]
 ### 12.1 送信データ
 
 このツールが外部に送信するもの:
-- `shopify.dev/**` への GET リクエスト (User-Agent = `shopify-rextant/0.1.1`)
+- `shopify.dev/**` への GET リクエスト (User-Agent = `shopify-rextant/<binary version>`)
 - `shopify.dev/changelog/feed` への GET リクエスト
+- v0.2.0以降、`shopify.dev/admin-graphql-direct-proxy/{version}` へのPOSTリクエスト。送信bodyは固定のGraphQL introspection queryのみ
 
 **送信しないもの**:
 - ユーザのコード
@@ -1494,7 +1597,7 @@ MCPレスポンスのエラー構造(`JSON-RPC error` 準拠):
 |---|---|---|
 | -32001 | Index not built | Yes (run build) |
 | -32002 | Path not found | No |
-| -32003 | Version not indexed | Yes (run build --version X) |
+| -32003 | Version not indexed | Yes (run build or future version-specific build) |
 | -32004 | Corrupted index | Yes (run build --force) |
 | -32005 | Network unavailable for refresh | Yes (待機) |
 | -32006 | Invalid query syntax | No |
@@ -1518,7 +1621,7 @@ MCPレスポンスのエラー構造(`JSON-RPC error` 準拠):
 
 - `classify(path)` の分類テーブル網羅
 - `compute_staleness` のエッジケース(閾値境界)
-- GraphQL SDLパーサ(小規模サンプルSDL)
+- GraphQL introspection parser(小規模サンプルJSON)
 - BFS + topological sort(人工グラフ)
 - query interpretation の優先順位
 - `canonical_doc_path(url)` の正規化(fragment/query/trailing slash/.md/.txt除去)
@@ -1535,13 +1638,17 @@ MCPレスポンスのエラー構造(`JSON-RPC error` 準拠):
 - `llms.txt` に無く `sitemap.xml` にだけ存在するdocsがindexされる
 - raw markdownが無いURLは `coverage_reports.status="skipped"` として残り、`shopify_status.coverage` に反映される
 - `shopify_map` は同一pathを重複nodeとして返さない
-- `shopify_fetch(url=...)` はv0.5までdisabled errorを返し、許可外host/pathにはHTTP requestを送らない
+- `shopify_fetch(url=...)` は `[index].enable_on_demand_fetch=false` なら `-32007` を返し、許可外host/pathにはHTTP requestを送らず `-32008` を返す
+- `shopify_fetch(url=...)` / 未収録canonical path は有効化時にraw保存、`docs.source="on_demand"` upsert、Tantivy差分更新まで完了する
+- `shopify_map` は0件時に許可済みURL/pathだけ `on_demand_candidate` を返し、fetchはしない
+- `shopify-rextant coverage repair` は同じon-demand policyで failed coverage row を再試行する
 
 ### 14.3 E2E tests
 
 - `cargo run -- serve` + 実Claude Code起動(手動)
 - `cargo run -- build` → `shopify_map` → `shopify_fetch` の往復が成功
 - Codex MCP stdioで `initialize` → `tools/list` → `tools/call(shopify_status)` が成功し、初回応答P50 <20ms
+- `[index].enable_on_demand_fetch=true` の一時homeで、実Shopify docs URLの `shopify_fetch(url)` がraw markdownを取得し、直後の `search` で `source="on_demand"` として見つかる
 - `optional scopes` / `manage access scopes` 系クエリが `shopify_map` から公式docs pathへ到達できる
 - `shopify_fetch(path, anchor)` で該当セクションだけが返り、`sections` に見出し一覧が含まれる
 
@@ -1553,6 +1660,18 @@ MCPレスポンスのエラー構造(`JSON-RPC error` 準拠):
 - graph swap latency
 - BFS traversal with varying graph size
 - MCP initialize round-trip with newline-delimited JSON framing
+
+Implemented release-contract benchmark:
+
+```bash
+cargo bench --bench release_contract
+```
+
+The benchmark builds a deterministic local fixture once and measures `status`,
+`search_docs("Product")`, `shopify_map("Product")`, and `shopify_fetch(Product path)`
+without live network access. It is intended as the permanent release gate until the
+codebase is split into a library crate and lower-level graph/search microbenchmarks can
+call public APIs directly.
 
 ### 14.5 回帰保護
 
@@ -1579,63 +1698,153 @@ MCPレスポンスのエラー構造(`JSON-RPC error` 準拠):
 **動作目標**: Claude Code から `shopify-rextant` で検索と読み取りができる。公式Dev MCPより速い。
 
 ### v0.1.1 (Week 1.5, ~4時間)
-- [ ] sitemap discoveryを実装し、`llms.txt` + `sitemap.xml` のunionでdocsを取り込む
-- [ ] `coverage_report` を保存し、`shopify_status` に skipped/failed/last_sitemap_at を表示
-- [ ] `shopify_map` のnodesを `path` でdedupeする
-- [ ] `shopify_map.meta.graph_available=false` と `query_interpretation` を返し、v0.1系がFTS候補であることを明示する
-- [ ] `shopify_fetch` / CLI `show` の `anchor` セクション切り出しに対応
-- [ ] `include_code_blocks=false` のcode block除外に対応
-- [ ] `/docs/api/admin-graphql`、`/docs/api/storefront` などルートAPIページの `api_surface` 分類を修正
-- [ ] MCP接続E2EをCI fixture化し、initialize応答P50 <20msを回帰保護する
+- [x] sitemap discoveryを実装し、`llms.txt` + `sitemap.xml` のunionでdocsを取り込む
+- [x] `coverage_report` を保存し、`shopify_status` に skipped/failed/last_sitemap_at を表示
+- [x] `shopify_map` のnodesを `path` でdedupeする
+- [x] `shopify_map.meta.graph_available=false` と `query_interpretation` を返し、v0.1系がFTS候補であることを明示する
+- [x] `shopify_fetch` / CLI `show` の `anchor` セクション切り出しに対応
+- [x] `include_code_blocks=false` のcode block除外に対応
+- [x] `/docs/api/admin-graphql`、`/docs/api/storefront` などルートAPIページの `api_surface` 分類を修正
+- [x] MCP接続E2EをCI fixture化し、initialize応答P50 <20msを回帰保護する
 
 **動作目標**: `optional_scopes` のような設定系docsをweb searchなしで発見できる。v0.1系のレスポンスが「本物のgraph」と誤解されない。
 
-### v0.2 (Week 2, ~14時間)
-- [ ] GraphQL SDL fetch + parse + concepts/edges 投入
-- [ ] petgraph in-memory graph構築
-- [ ] BFS展開 + suggested_reading_order
-- [ ] graph.msgpack snapshot
-- [ ] guide/tutorialからのreferences_type edge抽出
-- [ ] task graph初期実装
-- [ ] v0.1.1のFTS entry_pointsをconcept/doc/task graphの起点へ昇格する
-- [ ] edgesが空の場合はgraph構築失敗またはcoverage不足としてwarningを返す
+### v0.1.2 (Test hardening, ~2-3時間)
+- [x] `build_index` をテスト用source URL注入可能な内部構造へ分離する(public CLI/MCP契約は変更しない)
+- [x] 最小shopify.dev mock fixtureで `llms.txt` + `sitemap.xml` union のfull buildを検証する
+- [x] raw markdownが無いURLを `coverage_reports.status="skipped"` として保存し、`shopify_status.coverage` に反映されることを検証する
+- [x] `shopify_map` の `meta.graph_available=false` / `query_interpretation` / zero-result query_plan をcontract test化する
+- [x] `shopify_fetch(path, anchor)` の `sections` / `truncated` / `include_code_blocks=false` をresponse-levelで検証する
+- [x] Content-Length framed MCP requestのtransport fixtureを追加する
 
-**動作目標**: `shopify_map("Product")` で関連型・関連guideの地図が返る。
+**動作目標**: v0.1.1のsitemap discovery、coverage reporting、FTS map contract、fetch section extraction、MCP transport互換性をネットワーク非依存の `cargo test` で回帰保護できる。
 
-### v0.3 (Week 3, ~10時間)
-- [ ] changelog RSS watcher
-- [ ] scheduled_changes 抽出(正規表現ベース)
-- [ ] references_deprecated フラグ付与
-- [ ] upcoming_changes のstaleness埋め込み
-- [ ] aging_sweeper + version_watcher
-- [ ] `shopify_status` ツール + CLI `status`
+### v0.2.0 (implemented, Graph map foundation)
+
+**目的**: v0.1系のFTS候補リストを、Admin GraphQLのconcept/doc graphに昇格する。`shopify_map` が「本物の地図」を返す最初のリリースにする。
+
+**解かないこと**:
+- changelog watcher / scheduled_changes / deprecation freshness hydration (v0.3)
+- query_log由来のedge_repairerとmissing edge学習 (v0.4)
+- URL指定on-demand fetch / coverage repair command (v0.5)
+- GraphQL/Liquidコード検証、実店舗操作、LLM要約・回答合成 (scope out / never)
+
+**制約**:
+- Graph sourceは公式 `shopify.dev/admin-graphql-direct-proxy/{version}` のintrospectionに限定する。認証済みストアのAdmin API endpointは叩かない
+- local-first / zero telemetry / no synthesis を維持する。ユーザコード、クエリ、MCP client情報を外部送信しない
+- v0.1.1の `shopify_fetch`、`shopify_status.coverage`、`shopify_map.meta.query_interpretation` は後方互換を維持する
+- `meta.graph_available=true` はconcept/edge graphが構築済みの時だけ返す。FTS fallbackのみならfalseのままにする
+
+**最低限**:
+- [x] Admin GraphQL direct proxyへintrospection queryを送り、バージョン別schema snapshotを `data/schemas/admin-graphql/{version}.introspection.json` に保存する
+- [x] `concepts` / `edges` / `tasks` テーブルを現行SQLite migrationへ追加し、`SCHEMA_VERSION` をv0.2.0用に更新する
+- [x] Object/InputObject/Interface/Union/Enum/Scalar/Field/InputField/EnumValueをconcept化し、`defined_in` / `has_field` / `returns` / `accepts_input` / `implements` / `member_of` edgeを作る
+- [x] docs階層から `parent_of` / `next` / `prev` edge、Markdown link/related sectionから `see_also` edge、GraphQL code blockから `references_type` edgeを抽出する
+- [x] SQLiteからgraph representationを構築し、`data/graph.msgpack` にsnapshot保存する
+- [x] `shopify_map` が `concept_name` / `doc_path` / `task_name` / `free_text` を既存ルールで解釈し、concept/doc/task graph上のBFS結果を返す
+- [x] `suggested_reading_order` はdoc_type rank + concept依存順の決定的ソートで返す
+- [x] graphが空またはschema未取得なら、エラーではなく `graph_available=false` とcoverage/graph warningを返してv0.1.1相当のFTS導線に落とす
+
+**実装ソース**:
+- `src/main.rs` の build pipeline は、Admin GraphQL introspection取得、schema snapshot保存、concept/edge投入、graph snapshot保存、changelog pollingまでを実行する
+- `src/main.rs` の `shopify_map` はconcept/doc/free textをgraph entry pointへ解釈し、graphが使えない時はFTS fallbackとwarningを返す
+- `src/main.rs` のテストは、Product concept map、doc pathからconcept到達、free text昇格、schemaなしfallback、返却node内edge closureをfixtureで検証する
+
+**検証基準**:
+- WHEN mock direct proxyがProduct/ProductVariant/ProductInputを含むintrospection JSONを返す THEN `build_index_from_sources` はconcepts/edgesを保存し、`status` に `graph.concept_count > 0` と `graph.edge_count > 0` を返す
+- WHEN `shopify_map({"from":"Product","version":"2026-04"})` を呼ぶ THEN `center.kind="concept"`、`meta.graph_available=true`、`meta.query_interpretation.resolved_as="concept_name"`、`edges` が非空、`suggested_reading_order` にProduct reference doc pathが含まれる
+- WHEN `shopify_map({"from":"/docs/api/admin-graphql/2026-04/objects/Product"})` を呼ぶ THEN doc nodeから `defined_in` / `references_type` edgeを通じてProduct conceptへ到達できる
+- WHEN `shopify_map({"from":"discount function cart level"})` を呼ぶ THEN tantivy top docをentry pointにし、昇格できたconcept/doc graphを返す。昇格できない候補もdoc nodeとして失わない
+- WHEN schema snapshotが無い、壊れている、またはedge数0 THEN `shopify_map` はpanicせず `graph_available=false` と `query_plan[0].action="inspect_status"` を返す
+- WHEN graph snapshotが存在する THEN `serve` 起動時にSQLite full rebuildを避け、`initialize` → `tools/list` → `tools/call(shopify_status)` のP50 <20msを維持する
+
+**動作目標**: `shopify_map("Product")` でAdmin GraphQLの関連型・関連guide・読む順を含む地図が返る。
+
+### v0.3.0 (Freshness and changelog impact, Week 3, ~10時間)
+
+**目的**: changelogとindex鮮度をsource mapに接続し、エージェントが古い・deprecated・近く壊れる可能性のあるdocsを誤って信頼しないようにする。
+
+**解かないこと**:
+- changelog本文だけをSSoTにした影響範囲確定
+- schema diffによるversion間の完全なbreaking change検出
+- query_log由来のedge_repairerとmissing edge学習 (v0.4)
+- URL指定on-demand fetch / coverage repair command (v0.5)
+- GraphQL/Liquidコード検証、実店舗操作、LLM要約・回答合成 (scope out / never)
+
+**制約**:
+- changelog impactのSSoTは `concepts` / `docs` / `edges` とする。RSS本文から抽出した候補は、index上で解決できたものだけを採用する
+- SSoTに解決できない候補は `unresolved_affected_refs` として保持し、`references_deprecated` / `upcoming_changes` には反映しない
+- version watcherのSSoTはschema/doc indexとする。HTMLだけをversion sourceにしない
+- local-first / zero telemetry / no synthesis を維持する。ユーザコード、クエリ、MCP client情報を外部送信しない
+- `refresh` はPATH指定時の単一doc更新と、PATH未指定時のaging/stale sweepを分ける。full rebuildは `build` の責務に残す
+
+**最低限**:
+- [x] changelog RSS watcher
+- [x] changelog title/body/link/categoriesから影響候補を抽出し、`concepts` / `docs` / `edges` で解決できた候補だけを `affected_types` として保存する
+- [x] 未解決候補を `unresolved_affected_refs` として保存し、deprecated/staleness判定から除外する
+- [x] scheduled_changes 抽出(正規表現ベース、ただしtype_nameは解決済みconcept/docに限定)
+- [x] references_deprecated フラグ付与
+- [x] upcoming_changes のstaleness埋め込み
+- [x] aging_sweeper
+- [x] version_watcher
+- [x] `shopify_status` ツール + CLI `status`
+
+**検証基準**:
+- WHEN changelog feed fixture contains `DraftOrderLineItem.grams field removed in 2026-07` AND `concepts` contains `admin_graphql.2026-04.DraftOrderLineItem.grams` THEN `scheduled_changes` stores the removal and docs connected to that concept return `staleness.references_deprecated=true`
+- WHEN changelog text mentions an unknown symbol that is absent from `concepts` and `docs` THEN it is stored in `unresolved_affected_refs` and no doc is marked `references_deprecated`
+- WHEN a changelog entry links to an indexed docs path THEN the watcher resolves the path through `docs.path`, expands impact through `edges`, and records affected docs/concepts without relying on changelog prose alone
+- WHEN `shopify_map` returns a doc or concept affected by a scheduled change THEN the node `staleness.upcoming_changes` includes `effective_date`, `change`, and optional `migration_hint`
+- WHEN `shopify-rextant refresh` is run without PATH THEN only aging/stale docs are considered for refresh, and full index rebuild is not invoked
+- WHEN `shopify_status` is called after workers run THEN it includes worker last-run timestamps, freshness distribution, and changelog polling warnings
 
 **動作目標**: deprecation警告つきのmapが返る。古くなったインデックスが自動更新される。
 
-### v0.4 (Week 4+, 継続改善)
+### v0.4.0 (remaining continuous improvement)
+
+**目的**: v0.2 graphとv0.5 on-demand fetchの運用ログを使い、検索・edge coverageの穴を継続的に小さくする。
+
+**残対応**:
 - [ ] edge_repairer (query_logから欠落エッジ検出)
-- [ ] 日本語tokenizer (lindera) 本格統合
-- [ ] Homebrew tap + GitHub Actions release
-- [ ] NixOS flake
-- [ ] ベンチマーク + チューニング
-- [ ] ドキュメントサイト(README、CONTRIBUTING)
+- [x] 日本語tokenizer (lindera) 本格統合
 - [ ] query_logから低ヒット率クエリを抽出し、検索ルール改善候補を生成
 - [ ] map直後にfetchされたdocをmissing edge候補としてedge_repairerに投入
 
-### v0.5 (New, ~8時間)
-- [ ] `shopify_fetch` / `refresh --url` のオンデマンドfetchを実装する
-- [ ] 未収録の `https://shopify.dev/docs/**` URLを受け取ったらraw取得、docs upsert、tantivy差分投入を行う
-- [ ] オンデマンドfetch対象を `shopify.dev/docs/**` と `shopify.dev/changelog/**` に制限する
-- [ ] `shopify_map` 検索0件時に、推定docs URL候補と `enable_on_demand_fetch` の状態を返す
-- [ ] coverage_reportの失敗URLを再試行する `shopify-rextant coverage repair` を追加
-- [ ] on-demandで追加されたdocを `source="on_demand"` として記録し、次回full buildでsitemap由来docと統合する
+**検証基準**:
+- WHEN low-hit query_log rows exist THEN diagnostics reports candidate rule/edge improvements without mutating docs automatically
+- WHEN `shopify_map` is followed by `shopify_fetch` for a doc outside the returned graph THEN an idempotent missing-edge candidate is recorded
+- WHEN an edge candidate has enough source evidence THEN edge_repairer inserts an evidence-backed edge; otherwise it remains a rejected/pending candidate
+
+### v0.5.0 (implemented, on-demand recovery)
+- [x] `shopify_fetch` / `refresh --url` のオンデマンドfetchを実装する
+- [x] 未収録の `https://shopify.dev/docs/**` URLを受け取ったらraw取得、docs upsert、tantivy差分投入を行う
+- [x] オンデマンドfetch対象を `shopify.dev/docs/**` と `shopify.dev/changelog/**` に制限する
+- [x] `shopify_map` 検索0件時に、推定docs URL候補と `enable_on_demand_fetch` の状態を返す
+- [x] coverage_reportの失敗URLを再試行する `shopify-rextant coverage repair` を追加
+- [x] on-demandで追加されたdocを `source="on_demand"` として記録し、次回full buildでsitemap由来docと統合する
 
 **動作目標**: indexに漏れた公式docsでも、エージェントがURLまたはpathを知っていればその場で回収できる。ただし任意URL fetcherにはしない。
 
-### v1.0 (公開)
+### v1.0 (remaining public release readiness)
+
+**目的**: ローカル利用の実装を、他の開発者が安全に導入・検証・配布できる公開品質へ引き上げる。
+
+**残対応**:
+- [x] `Cargo.toml` の package version と公開metadataをリリース対象に合わせる
+- [x] `shopify-rextant version` / `--version` / HTTP User-Agent が公開バージョンと一致することを確認する
+- [ ] pre-release source install手順からpublic install手順へREADMEを切り替える
 - [ ] E2Eテスト、性能保証
 - [ ] セキュリティレビュー
+- [ ] Homebrew tap + GitHub Actions release
+- [ ] NixOS flake
+- [x] ベンチマーク + チューニング
+- [x] ドキュメントサイト(README、CONTRIBUTING)
 - [ ] Shopify developer コミュニティへの紹介記事(Zenn日本語 + dev.to英語)
+
+**検証基準**:
+- WHEN release CI runs THEN cargo tests, MCP fixture smoke, packaging checks, and security checks pass on supported platforms
+- WHEN a release tag is cut THEN `Cargo.toml` package version, CLI `--version`, User-Agent, and release artifact names all refer to the same version
+- WHEN a new user installs from a documented channel THEN `shopify-rextant build`, `serve`, `search`, and `show` work without reading project internals
+- WHEN benchmark fixtures run THEN local search/fetch latency and index size stay within documented thresholds
 
 ### 明示未対応項目の振り分け
 

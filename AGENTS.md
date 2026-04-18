@@ -88,6 +88,15 @@ When touching indexing or search coverage, verify at least one query that previo
 - Product naming: `shopify-rextant` is the official name.
 - Scope allocation: unrepresented work should be grouped with the same feature timing; otherwise lightweight work goes to `v0.1.1`, heavy new work goes to `v0.5`.
 - Product boundary: local-first, zero telemetry, no LLM synthesis, no live Shopify store mutations.
+- v0.2 graph scope: build the first real graph map from Admin GraphQL concepts/docs; keep Storefront GraphQL, Liquid, Functions, and Polaris concept extraction as follow-up work on the same graph foundation.
+- Schema source: use Shopify's public `shopify.dev/admin-graphql-direct-proxy/{version}` introspection for index builds; do not hit authenticated store Admin API endpoints.
+- v0.3 changelog impact: extract candidates from changelog text, but use `concepts` / `docs` / `edges` as the SSoT; unresolved candidates must not mark docs deprecated.
+- v0.3 version watcher: run as a `serve` background worker; use the official versioning page only for candidates, then validate availability with Shopify's public Admin GraphQL direct proxy before queueing a rebuild.
+- v0.3 implementation shape: first preserve the current single-file implementation with explicit internal boundaries and fixture-backed contracts; split modules only after behavior is covered.
+- v0.4 tokenizer: keep `lindera` / IPADIC always-on; use separate `content_en` and `content_ja` Tantivy fields and query both so Japanese queries do not replace English type/path search. Pin Tantivy to the version compatible with the selected `lindera-tantivy` release.
+- v0.4 edge repair: keep an `edge_candidates` table for idempotency and accepted/rejected state, then automatically insert evidence-backed repaired edges; if precision is poor, tighten evidence rules rather than making repair candidate-only.
+- v0.4 diagnostics: expose detailed low-hit query, edge candidate, and repair reports through a CLI `diagnostics` command; keep `shopify_status` limited to lightweight counts, timestamps, and warnings.
+- v0.5 on-demand fetch: default network use to disabled, allow only explicit local configuration, and do not expose a per-call MCP argument that lets an agent enable network fetches.
 
 ## 未確定ドメイン（U）
 
