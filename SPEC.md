@@ -1645,6 +1645,10 @@ MCPレスポンスのエラー構造(`JSON-RPC error` 準拠):
 
 ### 14.3 E2E tests
 
+- GitHub Actions CI gate runs `cargo fmt --check`, `cargo test`,
+  `cargo bench --bench release_contract -- --test`, `cargo package --list`,
+  `cargo package`, `cargo build --release`, and newline-delimited MCP `initialize`
+  smoke before release branching/tagging.
 - `cargo run -- serve` + 実Claude Code起動(手動)
 - `cargo run -- build` → `shopify_map` → `shopify_fetch` の往復が成功
 - Codex MCP stdioで `initialize` → `tools/list` → `tools/call(shopify_status)` が成功し、初回応答P50 <20ms
@@ -1832,7 +1836,8 @@ call public APIs directly.
 - [x] `Cargo.toml` の package version と公開metadataをリリース対象に合わせる
 - [x] `shopify-rextant version` / `--version` / HTTP User-Agent が公開バージョンと一致することを確認する
 - [ ] pre-release source install手順からpublic install手順へREADMEを切り替える
-- [ ] E2Eテスト、性能保証
+- [x] CI release gate(fmt/test/bench compile/package/MCP initialize smoke)
+- [ ] E2Eテスト(実Claude Code/Codex + on-demand実URL)、性能保証(P50/P99閾値)
 - [ ] セキュリティレビュー
 - [ ] Homebrew tap + GitHub Actions release
 - [ ] NixOS flake
