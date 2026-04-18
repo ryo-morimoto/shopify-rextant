@@ -4,6 +4,7 @@ mod domain;
 mod graphql;
 mod map;
 mod markdown;
+mod mcp;
 mod mcp_framing;
 mod on_demand;
 mod search;
@@ -66,39 +67,42 @@ use url_policy::{
     extract_version, is_indexable_shopify_url, raw_doc_candidates, raw_path_for, reading_time_min,
 };
 use util::hash::hex_sha256;
-use util::json::{merge_json_arrays, print_json, to_json_value};
+use util::json::{merge_json_arrays, print_json};
+#[cfg(test)]
+use util::json::to_json_value;
 use util::time::now_iso;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+#[cfg(test)]
 use mcp_framing::{read_message as read_mcp_message, write_json as write_mcp_message};
 use on_demand::{
     FetchCandidate as OnDemandFetchCandidate, FetchPolicy as OnDemandFetchPolicy,
     is_allowed_path as is_on_demand_allowed_path,
 };
+use mcp::daemon::{run_daemon, serve};
+#[cfg(test)]
+use mcp::daemon::{DaemonIdentity, DaemonPaths};
+use mcp::protocol::json_rpc_error;
+#[cfg(test)]
+use mcp::protocol::handle_mcp_request;
+use mcp::server::serve_direct;
 use search::index_io::{
     add_tantivy_doc, create_or_reset_index, rebuild_tantivy_from_db, upsert_tantivy_doc,
 };
 use search::runtime::{SearchRuntime, sqlite_like_search};
 use search::schema::{SearchFields, search_schema};
-use search::tokenizer::{japanese_segmenter, register_japanese_tokenizer};
+use search::tokenizer::register_japanese_tokenizer;
 use source::reqwest_source::ReqwestTextSource;
 pub(crate) use source::text_source::TextSource;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
 use tantivy::doc;
 
 const SHOPIFY_LLMS_URL: &str = "https://shopify.dev/llms.txt";
@@ -106,7 +110,7 @@ const SHOPIFY_SITEMAP_URL: &str = "https://shopify.dev/sitemap.xml";
 const SHOPIFY_CHANGELOG_FEED_URL: &str = "https://shopify.dev/changelog/feed.xml";
 const SHOPIFY_VERSIONING_URL: &str = "https://shopify.dev/docs/api/usage/versioning";
 pub(crate) const USER_AGENT: &str = concat!("shopify-rextant/", env!("CARGO_PKG_VERSION"));
-const SCHEMA_VERSION: &str = "3";
+pub(crate) const SCHEMA_VERSION: &str = "3";
 pub(crate) const ADMIN_GRAPHQL_INTROSPECTION_QUERY: &str = r#"
 query ShopifyRextantIntrospection {
   __schema {
@@ -276,7 +280,7 @@ impl From<anyhow::Error> for ToolError {
 }
 
 impl ToolError {
-    fn json_rpc_error(&self) -> Value {
+    pub(crate) fn json_rpc_error(&self) -> Value {
         match self {
             Self::Rpc {
                 code,
@@ -299,7 +303,7 @@ impl ToolError {
         }
     }
 
-    fn outside_scope(input: &str) -> Self {
+    pub(crate) fn outside_scope(input: &str) -> Self {
         Self::Rpc {
             code: -32008,
             message: "URL outside allowed Shopify docs scope".to_string(),
@@ -315,10 +319,10 @@ impl ToolError {
 }
 
 #[derive(Debug, Deserialize)]
-struct SearchArgs {
-    query: String,
-    version: Option<String>,
-    limit: Option<usize>,
+pub(crate) struct SearchArgs {
+    pub(crate) query: String,
+    pub(crate) version: Option<String>,
+    pub(crate) limit: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -715,724 +719,6 @@ async fn refresh_stale_docs_from_source<S: TextSource>(paths: &Paths, source: &S
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct DaemonIdentity {
-    canonical_home: PathBuf,
-    package_version: String,
-    schema_version: String,
-    config_hash: String,
-}
-
-#[derive(Debug, Clone)]
-struct DaemonPaths {
-    identity: DaemonIdentity,
-    socket: PathBuf,
-    lock: PathBuf,
-    pid: PathBuf,
-}
-
-struct DaemonLock {
-    path: PathBuf,
-}
-
-impl Drop for DaemonLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-impl DaemonIdentity {
-    fn for_paths(paths: &Paths) -> Result<Self> {
-        fs::create_dir_all(&paths.home)
-            .with_context(|| format!("create {}", paths.home.display()))?;
-        let canonical_home = fs::canonicalize(&paths.home)
-            .with_context(|| format!("canonicalize {}", paths.home.display()))?;
-        let config_hash = hash_optional_file(&canonical_home.join("config.toml"))?;
-        Ok(Self {
-            canonical_home,
-            package_version: env!("CARGO_PKG_VERSION").to_string(),
-            schema_version: SCHEMA_VERSION.to_string(),
-            config_hash,
-        })
-    }
-
-    fn hash(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.canonical_home.to_string_lossy().as_bytes());
-        hasher.update([0]);
-        hasher.update(self.package_version.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.schema_version.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.config_hash.as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
-}
-
-impl DaemonPaths {
-    fn for_paths(paths: &Paths) -> Result<Self> {
-        let identity = DaemonIdentity::for_paths(paths)?;
-        let identity_hash = identity.hash();
-        let runtime_dir = daemon_runtime_dir()?;
-        Ok(Self {
-            socket: runtime_dir.join(format!("{identity_hash}.sock")),
-            lock: runtime_dir.join(format!("{identity_hash}.lock")),
-            pid: runtime_dir.join(format!("{identity_hash}.pid")),
-            identity,
-        })
-    }
-}
-
-impl DaemonLock {
-    fn acquire(path: &Path, timeout: Duration) -> Result<Self> {
-        let started = Instant::now();
-        loop {
-            match OpenOptions::new().write(true).create_new(true).open(path) {
-                Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id())?;
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_file_is_stale(path, Duration::from_secs(30))
-                        || started.elapsed() > timeout
-                    {
-                        let _ = fs::remove_file(path);
-                        continue;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-}
-
-fn hash_optional_file(path: &Path) -> Result<String> {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let mut hasher = Sha256::new();
-            hasher.update(bytes);
-            Ok(format!("{:x}", hasher.finalize()))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("missing".to_string()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn daemon_runtime_dir() -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join("shopify-rextant-daemons");
-    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-    Ok(dir)
-}
-
-fn lock_file_is_stale(path: &Path, max_age: Duration) -> bool {
-    path.metadata()
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .map(|elapsed| elapsed > max_age)
-        .unwrap_or(true)
-}
-
-fn daemon_socket_healthy(socket: &Path) -> bool {
-    let Ok(mut writer) = UnixStream::connect(socket) else {
-        return false;
-    };
-    let _ = writer.set_read_timeout(Some(Duration::from_millis(500)));
-    let _ = writer.set_write_timeout(Some(Duration::from_millis(500)));
-    let Ok(reader_stream) = writer.try_clone() else {
-        return false;
-    };
-    let mut reader = std::io::BufReader::new(reader_stream);
-    if write_mcp_message(
-        &mut writer,
-        &json!({"jsonrpc":"2.0","id":"health","method":"tools/list"}),
-    )
-    .is_err()
-    {
-        return false;
-    }
-    let Ok(Some(message)) = read_mcp_message(&mut reader) else {
-        return false;
-    };
-    serde_json::from_slice::<Value>(&message)
-        .ok()
-        .and_then(|value| value.pointer("/result/tools").cloned())
-        .and_then(|tools| tools.as_array().map(|tools| !tools.is_empty()))
-        .unwrap_or(false)
-}
-
-fn cleanup_stale_daemon_artifacts(paths: &DaemonPaths) -> Result<()> {
-    if paths.socket.exists() && !daemon_socket_healthy(&paths.socket) {
-        fs::remove_file(&paths.socket)
-            .with_context(|| format!("remove stale socket {}", paths.socket.display()))?;
-    }
-    if paths.pid.exists() && !paths.socket.exists() {
-        fs::remove_file(&paths.pid)
-            .with_context(|| format!("remove stale pid {}", paths.pid.display()))?;
-    }
-    Ok(())
-}
-
-fn wait_for_daemon_ready(socket: &Path, timeout: Duration) -> Result<()> {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if daemon_socket_healthy(socket) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    bail!("daemon did not become ready at {}", socket.display())
-}
-
-fn daemon_idle_timeout_secs() -> u64 {
-    std::env::var("SHOPIFY_REXTANT_DAEMON_IDLE_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(600)
-}
-
-fn spawn_daemon(paths: &DaemonPaths) -> Result<()> {
-    let exe = std::env::current_exe()?;
-    ProcessCommand::new(exe)
-        .arg("--home")
-        .arg(&paths.identity.canonical_home)
-        .arg("daemon")
-        .arg("--idle-timeout-secs")
-        .arg(daemon_idle_timeout_secs().to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("spawn shopify-rextant daemon")?;
-    Ok(())
-}
-
-fn ensure_daemon(paths: &Paths) -> Result<DaemonPaths> {
-    let daemon_paths = DaemonPaths::for_paths(paths)?;
-    if daemon_socket_healthy(&daemon_paths.socket) {
-        return Ok(daemon_paths);
-    }
-    let _lock = DaemonLock::acquire(&daemon_paths.lock, Duration::from_secs(5))?;
-    if daemon_socket_healthy(&daemon_paths.socket) {
-        return Ok(daemon_paths);
-    }
-    cleanup_stale_daemon_artifacts(&daemon_paths)?;
-    spawn_daemon(&daemon_paths)?;
-    wait_for_daemon_ready(&daemon_paths.socket, Duration::from_secs(5))?;
-    Ok(daemon_paths)
-}
-
-fn write_mcp_body<W: Write>(writer: &mut W, body: &[u8]) -> Result<()> {
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(body)?;
-    writer.flush()?;
-    Ok(())
-}
-
-async fn serve(paths: Paths) -> Result<()> {
-    let daemon_paths = ensure_daemon(&paths)?;
-    let mut daemon_writer = UnixStream::connect(&daemon_paths.socket)
-        .with_context(|| format!("connect {}", daemon_paths.socket.display()))?;
-    let daemon_reader_stream = daemon_writer.try_clone()?;
-    let mut daemon_reader = std::io::BufReader::new(daemon_reader_stream);
-    let stdin = std::io::stdin();
-    let mut stdin_reader = std::io::BufReader::new(stdin.lock());
-    let stdout = std::io::stdout();
-    let mut stdout_writer = stdout.lock();
-
-    while let Some(message) = read_mcp_message(&mut stdin_reader)? {
-        let request: Value = serde_json::from_slice(&message)?;
-        write_mcp_body(&mut daemon_writer, &message)?;
-        if request.get("id").is_none() {
-            continue;
-        }
-        let response = read_mcp_message(&mut daemon_reader)?
-            .ok_or_else(|| anyhow!("daemon disconnected before response"))?;
-        let response: Value = serde_json::from_slice(&response)?;
-        write_mcp_message(&mut stdout_writer, &response)?;
-    }
-    Ok(())
-}
-
-async fn serve_direct(paths: Paths) -> Result<()> {
-    spawn_background_workers(paths.clone());
-    let state = Arc::new(ServerState::new(paths));
-    let stdin = std::io::stdin();
-    let mut reader = std::io::BufReader::new(stdin.lock());
-    let stdout = std::io::stdout();
-    let mut writer = stdout.lock();
-
-    while let Some(message) = read_mcp_message(&mut reader)? {
-        let request: Value = serde_json::from_slice(&message)?;
-        if request.get("id").is_none() {
-            continue;
-        }
-        let response = state.handle_mcp_request(request).await;
-        write_mcp_message(&mut writer, &response)?;
-    }
-    Ok(())
-}
-
-async fn run_daemon(paths: Paths, idle_timeout: Duration) -> Result<()> {
-    let daemon_paths = DaemonPaths::for_paths(&paths)?;
-    cleanup_stale_daemon_artifacts(&daemon_paths)?;
-    if daemon_paths.socket.exists() {
-        fs::remove_file(&daemon_paths.socket)
-            .with_context(|| format!("remove existing socket {}", daemon_paths.socket.display()))?;
-    }
-    let listener = UnixListener::bind(&daemon_paths.socket)
-        .with_context(|| format!("bind {}", daemon_paths.socket.display()))?;
-    let _ = fs::set_permissions(&daemon_paths.socket, fs::Permissions::from_mode(0o600));
-    fs::write(&daemon_paths.pid, std::process::id().to_string())
-        .with_context(|| format!("write {}", daemon_paths.pid.display()))?;
-    listener.set_nonblocking(true)?;
-
-    spawn_background_workers(paths.clone());
-    let state = Arc::new(ServerState::new(paths));
-    state.spawn_search_warmup();
-
-    let active_clients = Arc::new(AtomicUsize::new(0));
-    let last_idle = Arc::new(Mutex::new(Instant::now()));
-    let handle = tokio::runtime::Handle::current();
-
-    loop {
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                active_clients.fetch_add(1, Ordering::SeqCst);
-                spawn_daemon_client(
-                    stream,
-                    Arc::clone(&state),
-                    Arc::clone(&active_clients),
-                    Arc::clone(&last_idle),
-                    handle.clone(),
-                );
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error.into()),
-        }
-
-        if active_clients.load(Ordering::SeqCst) == 0 {
-            let idle_for = last_idle
-                .lock()
-                .map_err(|_| anyhow!("daemon idle lock poisoned"))?
-                .elapsed();
-            if idle_for >= idle_timeout {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let _ = fs::remove_file(&daemon_paths.socket);
-    let _ = fs::remove_file(&daemon_paths.pid);
-    Ok(())
-}
-
-fn spawn_daemon_client(
-    stream: UnixStream,
-    state: Arc<ServerState>,
-    active_clients: Arc<AtomicUsize>,
-    last_idle: Arc<Mutex<Instant>>,
-    handle: tokio::runtime::Handle,
-) {
-    std::thread::spawn(move || {
-        let result = handle_daemon_client(stream, state, handle);
-        if let Err(error) = result {
-            eprintln!("daemon client error: {error}");
-        }
-        if active_clients.fetch_sub(1, Ordering::SeqCst) == 1 {
-            if let Ok(mut last_idle) = last_idle.lock() {
-                *last_idle = Instant::now();
-            }
-        }
-    });
-}
-
-fn handle_daemon_client(
-    stream: UnixStream,
-    state: Arc<ServerState>,
-    handle: tokio::runtime::Handle,
-) -> Result<()> {
-    let reader_stream = stream.try_clone()?;
-    let mut reader = std::io::BufReader::new(reader_stream);
-    let mut writer = stream;
-    while let Some(message) = read_mcp_message(&mut reader)? {
-        let request: Value = serde_json::from_slice(&message)?;
-        if request.get("id").is_none() {
-            continue;
-        }
-        let response = handle.block_on(state.handle_mcp_request(request));
-        write_mcp_message(&mut writer, &response)?;
-    }
-    Ok(())
-}
-
-struct ServerState {
-    paths: Paths,
-    search_runtime: Mutex<Option<SearchRuntime>>,
-    search_warmup: Mutex<Option<std::thread::JoinHandle<Result<()>>>>,
-}
-
-impl ServerState {
-    fn new(paths: Paths) -> Self {
-        Self {
-            paths,
-            search_runtime: Mutex::new(None),
-            search_warmup: Mutex::new(None),
-        }
-    }
-
-    fn spawn_search_warmup(self: &Arc<Self>) {
-        if self
-            .search_runtime
-            .lock()
-            .map(|runtime| runtime.is_some())
-            .unwrap_or(false)
-        {
-            return;
-        }
-        let mut warmup = match self.search_warmup.lock() {
-            Ok(warmup) => warmup,
-            Err(_) => {
-                eprintln!("search runtime warmup setup error: lock poisoned");
-                return;
-            }
-        };
-        if warmup.is_some() {
-            return;
-        }
-        let state = Arc::clone(self);
-        let handle = std::thread::spawn(move || state.warm_search_runtime());
-        *warmup = Some(handle);
-    }
-
-    fn warm_search_runtime(&self) -> Result<()> {
-        let runtime = SearchRuntime::open(&self.paths)?;
-        let _ = japanese_segmenter()?;
-        let mut guard = self
-            .search_runtime
-            .lock()
-            .map_err(|_| anyhow!("search runtime lock poisoned"))?;
-        if guard.is_none() {
-            *guard = runtime;
-        }
-        Ok(())
-    }
-
-    fn finish_search_warmup(&self) -> Result<()> {
-        let handle = self
-            .search_warmup
-            .lock()
-            .map_err(|_| anyhow!("search warmup lock poisoned"))?
-            .take();
-        if let Some(handle) = handle {
-            handle
-                .join()
-                .map_err(|_| anyhow!("search runtime warmup panicked"))??;
-        }
-        Ok(())
-    }
-
-    async fn handle_mcp_request(self: &Arc<Self>, request: Value) -> Value {
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
-            "initialize" => {
-                self.spawn_search_warmup();
-                Ok(json!({
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": {
-                        "name": "shopify-rextant",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }))
-            }
-            "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
-            "tools/call" => {
-                self.call_mcp_tool(request.get("params").cloned().unwrap_or(Value::Null))
-                    .await
-            }
-            _ => Err(json_rpc_error(
-                -32601,
-                "Method not found",
-                json!({ "method": method }),
-            )),
-        };
-
-        match result {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err(error) => json!({ "jsonrpc": "2.0", "id": id, "error": error }),
-        }
-    }
-
-    async fn call_mcp_tool(&self, params: Value) -> std::result::Result<Value, Value> {
-        let name = params
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| json_rpc_error(-32602, "Missing tool name", Value::Null))?;
-        let args = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-
-        let value = match name {
-            "shopify_status" => status(&self.paths)
-                .map(to_json_value)
-                .map_err(ToolError::from),
-            "shopify_fetch" => {
-                let args: Result<FetchArgs> = serde_json::from_value(args)
-                    .map_err(|e| anyhow!("invalid shopify_fetch args: {e}"));
-                match args {
-                    Ok(args) => match shopify_fetch(&self.paths, &args).await {
-                        Ok(response) => self
-                            .reload_search_runtime()
-                            .map(|()| to_json_value(response))
-                            .map_err(ToolError::from),
-                        Err(error) => Err(error),
-                    },
-                    Err(error) => Err(ToolError::from(error)),
-                }
-            }
-            "shopify_map" => {
-                let args: Result<MapArgs> = serde_json::from_value(args)
-                    .map_err(|e| anyhow!("invalid shopify_map args: {e}"));
-                args.and_then(|args| {
-                    self.ensure_search_runtime()?;
-                    let guard = self
-                        .search_runtime
-                        .lock()
-                        .map_err(|_| anyhow!("search runtime lock poisoned"))?;
-                    shopify_map_with_runtime(&self.paths, &args, guard.as_ref()).map(to_json_value)
-                })
-                .map_err(ToolError::from)
-            }
-            "shopify_search" => {
-                let args: Result<SearchArgs> = serde_json::from_value(args)
-                    .map_err(|e| anyhow!("invalid shopify_search args: {e}"));
-                args.and_then(|args| {
-                    self.ensure_search_runtime()?;
-                    let guard = self
-                        .search_runtime
-                        .lock()
-                        .map_err(|_| anyhow!("search runtime lock poisoned"))?;
-                    search_docs_with_runtime(
-                        &self.paths,
-                        guard.as_ref(),
-                        &args.query,
-                        args.version.as_deref(),
-                        args.limit.unwrap_or(10),
-                    )
-                    .map(to_json_value)
-                })
-                .map_err(ToolError::from)
-            }
-            _ => Err(ToolError::from(anyhow!("unknown tool: {name}"))),
-        }
-        .map_err(|e| e.json_rpc_error())?;
-
-        let text = serde_json::to_string_pretty(&value)
-            .map_err(|e| json_rpc_error(-32000, &e.to_string(), Value::Null))?;
-        Ok(json!({
-            "content": [{ "type": "text", "text": text }],
-            "structuredContent": value,
-            "isError": false
-        }))
-    }
-
-    fn ensure_search_runtime(&self) -> Result<()> {
-        self.finish_search_warmup()?;
-        let mut guard = self
-            .search_runtime
-            .lock()
-            .map_err(|_| anyhow!("search runtime lock poisoned"))?;
-        if guard.is_none() && self.paths.tantivy.join("meta.json").exists() {
-            *guard = SearchRuntime::open(&self.paths)?;
-        }
-        Ok(())
-    }
-
-    fn reload_search_runtime(&self) -> Result<()> {
-        let mut guard = self
-            .search_runtime
-            .lock()
-            .map_err(|_| anyhow!("search runtime lock poisoned"))?;
-        *guard = SearchRuntime::open(&self.paths)?;
-        Ok(())
-    }
-}
-
-fn spawn_background_workers(paths: Paths) {
-    tokio::spawn(async move {
-        let source_urls = IndexSourceUrls::default();
-        let source = match ReqwestTextSource::new() {
-            Ok(source) => source,
-            Err(error) => {
-                eprintln!("version_watcher setup error: {error}");
-                return;
-            }
-        };
-        let mut interval = tokio::time::interval(Duration::from_secs(86_400));
-        loop {
-            interval.tick().await;
-            if let Err(error) = check_new_versions_from_source(&paths, &source_urls, &source).await
-            {
-                eprintln!("version_watcher error: {error}");
-            }
-        }
-    });
-}
-
-#[cfg(test)]
-async fn handle_mcp_request(paths: &Paths, request: Value) -> Value {
-    let id = request.get("id").cloned().unwrap_or(Value::Null);
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2025-11-25",
-            "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": {
-                "name": "shopify-rextant",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        })),
-        "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
-        "tools/call" => {
-            call_mcp_tool(paths, request.get("params").cloned().unwrap_or(Value::Null)).await
-        }
-        _ => Err(json_rpc_error(
-            -32601,
-            "Method not found",
-            json!({ "method": method }),
-        )),
-    };
-
-    match result {
-        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err(error) => json!({ "jsonrpc": "2.0", "id": id, "error": error }),
-    }
-}
-
-#[cfg(test)]
-async fn call_mcp_tool(paths: &Paths, params: Value) -> std::result::Result<Value, Value> {
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| json_rpc_error(-32602, "Missing tool name", Value::Null))?;
-    let args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let value = match name {
-        "shopify_status" => status(paths).map(to_json_value).map_err(ToolError::from),
-        "shopify_fetch" => {
-            let args: Result<FetchArgs> = serde_json::from_value(args)
-                .map_err(|e| anyhow!("invalid shopify_fetch args: {e}"));
-            match args {
-                Ok(args) => shopify_fetch(paths, &args).await.map(to_json_value),
-                Err(error) => Err(ToolError::from(error)),
-            }
-        }
-        "shopify_map" => {
-            let args: Result<MapArgs> =
-                serde_json::from_value(args).map_err(|e| anyhow!("invalid shopify_map args: {e}"));
-            args.and_then(|args| shopify_map(paths, &args).map(to_json_value))
-                .map_err(ToolError::from)
-        }
-        "shopify_search" => {
-            let args: Result<SearchArgs> = serde_json::from_value(args)
-                .map_err(|e| anyhow!("invalid shopify_search args: {e}"));
-            args.and_then(|args| {
-                search_docs(
-                    paths,
-                    &args.query,
-                    args.version.as_deref(),
-                    args.limit.unwrap_or(10),
-                )
-                .map(to_json_value)
-            })
-            .map_err(ToolError::from)
-        }
-        _ => Err(ToolError::from(anyhow!("unknown tool: {name}"))),
-    }
-    .map_err(|e| e.json_rpc_error())?;
-
-    let text = serde_json::to_string_pretty(&value)
-        .map_err(|e| json_rpc_error(-32000, &e.to_string(), Value::Null))?;
-    Ok(json!({
-        "content": [{ "type": "text", "text": text }],
-        "structuredContent": value,
-        "isError": false
-    }))
-}
-
-fn tool_descriptors() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "shopify_map",
-            "description": "Return a local source map of Shopify docs for a query, path, or concept-like term.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["from"],
-                "properties": {
-                    "from": { "type": "string" },
-                    "radius": { "type": "integer", "enum": [1, 2, 3], "default": 2 },
-                    "lens": { "type": "string", "enum": ["concept", "doc", "task", "auto"], "default": "auto" },
-                    "version": { "type": "string" },
-                    "max_nodes": { "type": "integer", "minimum": 1, "maximum": 100, "default": 30 }
-                }
-            }
-        }),
-        json!({
-            "name": "shopify_fetch",
-            "description": "Fetch raw Shopify documentation by local docs path. When local on-demand fetch is enabled, allowed shopify.dev docs/changelog URLs or unindexed canonical paths can be recovered and indexed.",
-            "inputSchema": {
-                "type": "object",
-                "anyOf": [
-                    { "required": ["path"] },
-                    { "required": ["url"] }
-                ],
-                "properties": {
-                    "path": { "type": "string" },
-                    "url": {
-                        "type": "string",
-                        "description": "Allowed only for https://shopify.dev/docs/** and https://shopify.dev/changelog/**. Requires [index].enable_on_demand_fetch=true in local config."
-                    },
-                    "anchor": { "type": "string" },
-                    "include_code_blocks": { "type": "boolean", "default": true },
-                    "max_chars": { "type": "integer", "minimum": 1, "default": 20000 }
-                }
-            }
-        }),
-        json!({
-            "name": "shopify_search",
-            "description": "Search the local Shopify documentation index.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["query"],
-                "properties": {
-                    "query": { "type": "string" },
-                    "version": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 }
-                }
-            }
-        }),
-        json!({
-            "name": "shopify_status",
-            "description": "Return local index status and warnings.",
-            "inputSchema": { "type": "object", "properties": {} }
-        }),
-    ]
-}
-
-fn json_rpc_error(code: i64, message: &str, data: Value) -> Value {
-    json!({ "code": code, "message": message, "data": data })
-}
 
 pub(crate) async fn shopify_fetch(
     paths: &Paths,
@@ -1543,7 +829,7 @@ pub(crate) fn shopify_map(paths: &Paths, args: &MapArgs) -> Result<MapResponse> 
     shopify_map_with_runtime(paths, args, None)
 }
 
-fn shopify_map_with_runtime(
+pub(crate) fn shopify_map_with_runtime(
     paths: &Paths,
     args: &MapArgs,
     search_runtime: Option<&SearchRuntime>,
@@ -2272,7 +1558,7 @@ pub(crate) fn search_docs(
     search_docs_with_runtime(paths, None, query, version, limit)
 }
 
-fn search_docs_with_runtime(
+pub(crate) fn search_docs_with_runtime(
     paths: &Paths,
     runtime: Option<&SearchRuntime>,
     query: &str,
@@ -2409,7 +1695,7 @@ async fn poll_changelog_from_source<S: TextSource>(
     Ok(report)
 }
 
-async fn check_new_versions_from_source<S: TextSource>(
+pub(crate) async fn check_new_versions_from_source<S: TextSource>(
     paths: &Paths,
     source_urls: &IndexSourceUrls,
     source: &S,

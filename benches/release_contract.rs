@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::OnceLock;
 
-#[allow(dead_code, private_interfaces)]
+#[allow(dead_code, private_interfaces, unused_imports)]
 #[path = "../src/lib.rs"]
 mod app;
 
