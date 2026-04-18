@@ -15,11 +15,23 @@ use changelog::impact::{
 };
 use changelog::types::{ChangelogEntryInput, ResolvedImpact, ScheduledChangeRecord};
 use domain::concepts::ConceptRecord;
+use domain::coverage::CoverageEvent;
 use domain::graph::{GraphBuild, GraphEdgeRecord, GraphNodeKey};
+use domain::map::{
+    GraphExpansion, MapCenter, MapIndexStatus, MapMeta, MapNode, OnDemandCandidate,
+    QueryInterpretation, Staleness,
+};
 use domain::source::SourceDoc;
+use domain::status::{
+    ChangelogStatus, CoverageSources, CoverageStatus, FreshnessStatus, GraphIndexStatus,
+    WorkerStatus,
+};
 
 pub(crate) use domain::docs::DocRecord;
+pub(crate) use domain::fetch::FetchResponse;
+pub(crate) use domain::map::MapResponse;
 pub(crate) use domain::source::SourceFetchError;
+pub(crate) use domain::status::StatusResponse;
 use graphql::resolve::{extract_named_type, markdown_mentions_type, resolve_concept_id};
 use graphql::schema_urls::{
     admin_graphql_direct_proxy_url, concept_id, graphql_concept_kind, graphql_reference_path,
@@ -193,161 +205,6 @@ pub(crate) struct Paths {
     raw: PathBuf,
     tantivy: PathBuf,
     db: PathBuf,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct StatusResponse {
-    schema_version: String,
-    data_dir: String,
-    index_built: bool,
-    doc_count: i64,
-    last_full_build: Option<String>,
-    index: GraphIndexStatus,
-    coverage: CoverageStatus,
-    freshness: FreshnessStatus,
-    workers: WorkerStatus,
-    changelog: ChangelogStatus,
-    warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct GraphIndexStatus {
-    concept_count: i64,
-    edge_count: i64,
-    graph_snapshot: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CoverageStatus {
-    last_sitemap_at: Option<String>,
-    discovered_count: i64,
-    indexed_count: i64,
-    skipped_count: i64,
-    failed_count: i64,
-    classified_unknown_count: i64,
-    sources: CoverageSources,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CoverageSources {
-    llms: i64,
-    sitemap: i64,
-    on_demand: i64,
-    manual: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct FreshnessStatus {
-    fresh_count: i64,
-    aging_count: i64,
-    stale_count: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct WorkerStatus {
-    last_changelog_at: Option<String>,
-    last_aging_sweep_at: Option<String>,
-    last_version_check_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ChangelogStatus {
-    entry_count: i64,
-    scheduled_change_count: i64,
-    unresolved_ref_count: i64,
-    last_warning: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct FetchResponse {
-    path: String,
-    title: String,
-    url: String,
-    source_url: String,
-    content: String,
-    sections: Vec<SectionInfo>,
-    truncated: bool,
-    staleness: Staleness,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MapResponse {
-    center: MapCenter,
-    nodes: Vec<MapNode>,
-    edges: Vec<Value>,
-    suggested_reading_order: Vec<String>,
-    query_plan: Vec<QueryPlanStep>,
-    index_status: StatusResponse,
-    meta: MapMeta,
-}
-
-#[derive(Debug, Serialize)]
-struct MapMeta {
-    generated_at: String,
-    index_age_days: i64,
-    versions_available: Vec<String>,
-    version_used: String,
-    coverage_warning: Option<String>,
-    graph_available: bool,
-    index_status: MapIndexStatus,
-    on_demand_candidate: Option<OnDemandCandidate>,
-    query_interpretation: QueryInterpretation,
-}
-
-#[derive(Debug, Serialize)]
-struct MapIndexStatus {
-    doc_count: i64,
-    skipped_count: i64,
-    failed_count: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct OnDemandCandidate {
-    url: String,
-    enabled: bool,
-    reason: String,
-}
-
-#[derive(Debug, Serialize)]
-struct QueryInterpretation {
-    resolved_as: String,
-    entry_points: Vec<String>,
-    confidence: String,
-}
-
-#[derive(Debug, Serialize)]
-struct MapCenter {
-    id: String,
-    kind: String,
-    path: Option<String>,
-    title: String,
-}
-
-#[derive(Debug, Serialize)]
-struct MapNode {
-    id: String,
-    kind: String,
-    subkind: String,
-    path: String,
-    title: String,
-    summary_from_source: String,
-    version: Option<String>,
-    api_surface: Option<String>,
-    doc_type: String,
-    reading_time_min: Option<i64>,
-    staleness: Staleness,
-    distance_from_center: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct Staleness {
-    age_days: i64,
-    freshness: String,
-    content_verified_at: String,
-    schema_version: Option<String>,
-    references_deprecated: bool,
-    deprecated_refs: Vec<String>,
-    upcoming_changes: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2838,24 +2695,6 @@ fn add_tantivy_doc(
     Ok(())
 }
 
-#[derive(Debug)]
-struct GraphExpansion {
-    nodes: Vec<MapNode>,
-    edges: Vec<Value>,
-    suggested_reading_order: Vec<String>,
-}
-
-#[derive(Debug)]
-struct CoverageEvent {
-    source: String,
-    canonical_path: Option<String>,
-    source_url: String,
-    status: String,
-    reason: Option<String>,
-    http_status: Option<u16>,
-    checked_at: String,
-}
-
 #[derive(Debug, Default)]
 struct ChangelogPollReport {
     entries_seen: usize,
@@ -2870,82 +2709,6 @@ struct VersionCheckReport {
     already_indexed: bool,
     enqueued: bool,
     warning: Option<String>,
-}
-
-impl CoverageEvent {
-    fn indexed(link: &MarkdownLink) -> Self {
-        Self {
-            source: link.source.clone(),
-            canonical_path: canonical_doc_path(&link.url).ok(),
-            source_url: link.url.clone(),
-            status: "indexed".to_string(),
-            reason: None,
-            http_status: None,
-            checked_at: now_iso(),
-        }
-    }
-
-    fn from_fetch_error(link: &MarkdownLink, error: SourceFetchError) -> Self {
-        Self {
-            source: link.source.clone(),
-            canonical_path: canonical_doc_path(&link.url).ok(),
-            source_url: link.url.clone(),
-            status: error.status,
-            reason: Some(error.reason),
-            http_status: error.http_status,
-            checked_at: now_iso(),
-        }
-    }
-}
-
-impl CoverageStatus {
-    fn empty() -> Self {
-        Self {
-            last_sitemap_at: None,
-            discovered_count: 0,
-            indexed_count: 0,
-            skipped_count: 0,
-            failed_count: 0,
-            classified_unknown_count: 0,
-            sources: CoverageSources {
-                llms: 0,
-                sitemap: 0,
-                on_demand: 0,
-                manual: 0,
-            },
-        }
-    }
-}
-
-impl FreshnessStatus {
-    fn empty() -> Self {
-        Self {
-            fresh_count: 0,
-            aging_count: 0,
-            stale_count: 0,
-        }
-    }
-}
-
-impl WorkerStatus {
-    fn empty() -> Self {
-        Self {
-            last_changelog_at: None,
-            last_aging_sweep_at: None,
-            last_version_check_at: None,
-        }
-    }
-}
-
-impl ChangelogStatus {
-    fn empty() -> Self {
-        Self {
-            entry_count: 0,
-            scheduled_change_count: 0,
-            unresolved_ref_count: 0,
-            last_warning: None,
-        }
-    }
 }
 
 async fn fetch_source_doc<S: TextSource>(
