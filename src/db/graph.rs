@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-use super::super::GraphEdgeRecord;
+use super::super::domain::graph::GraphEdgeRecord;
 use super::super::util::time::now_iso;
 
 pub(crate) fn insert_edge(conn: &Connection, edge: &GraphEdgeRecord) -> Result<()> {
