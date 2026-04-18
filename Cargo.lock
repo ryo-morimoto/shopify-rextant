@@ -2809,6 +2809,7 @@ dependencies = [
  "sha2",
  "tantivy",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "url",
 ]
