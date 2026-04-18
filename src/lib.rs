@@ -6,6 +6,7 @@ mod map;
 mod markdown;
 mod mcp_framing;
 mod on_demand;
+mod source;
 mod url_policy;
 mod util;
 
@@ -79,7 +80,8 @@ use on_demand::{
     FetchCandidate as OnDemandFetchCandidate, FetchPolicy as OnDemandFetchPolicy,
     is_allowed_path as is_on_demand_allowed_path,
 };
-use reqwest::StatusCode;
+use source::reqwest_source::ReqwestTextSource;
+pub(crate) use source::text_source::TextSource;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -106,9 +108,9 @@ const SHOPIFY_LLMS_URL: &str = "https://shopify.dev/llms.txt";
 const SHOPIFY_SITEMAP_URL: &str = "https://shopify.dev/sitemap.xml";
 const SHOPIFY_CHANGELOG_FEED_URL: &str = "https://shopify.dev/changelog/feed.xml";
 const SHOPIFY_VERSIONING_URL: &str = "https://shopify.dev/docs/api/usage/versioning";
-const USER_AGENT: &str = concat!("shopify-rextant/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("shopify-rextant/", env!("CARGO_PKG_VERSION"));
 const SCHEMA_VERSION: &str = "3";
-const ADMIN_GRAPHQL_INTROSPECTION_QUERY: &str = r#"
+pub(crate) const ADMIN_GRAPHQL_INTROSPECTION_QUERY: &str = r#"
 query ShopifyRextantIntrospection {
   __schema {
     types {
@@ -338,97 +340,6 @@ impl Default for IndexSourceUrls {
             changelog: SHOPIFY_CHANGELOG_FEED_URL.to_string(),
             versioning: SHOPIFY_VERSIONING_URL.to_string(),
         }
-    }
-}
-
-pub(crate) trait TextSource {
-    async fn fetch_text(&self, url: &str) -> std::result::Result<String, SourceFetchError>;
-
-    async fn fetch_admin_graphql_introspection(
-        &self,
-        url: &str,
-    ) -> std::result::Result<String, SourceFetchError> {
-        self.fetch_text(url).await
-    }
-}
-
-struct ReqwestTextSource {
-    client: reqwest::Client,
-}
-
-impl ReqwestTextSource {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            client: reqwest::Client::builder().user_agent(USER_AGENT).build()?,
-        })
-    }
-}
-
-impl TextSource for ReqwestTextSource {
-    async fn fetch_text(&self, url: &str) -> std::result::Result<String, SourceFetchError> {
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| SourceFetchError {
-                status: "failed".to_string(),
-                reason: format!("network_error: {e}"),
-                http_status: None,
-            })?;
-        let status = response.status();
-        if status == StatusCode::OK {
-            return response.text().await.map_err(|e| SourceFetchError {
-                status: "failed".to_string(),
-                reason: format!("network_error: {e}"),
-                http_status: Some(StatusCode::OK.as_u16()),
-            });
-        }
-        Err(SourceFetchError {
-            status: "skipped".to_string(),
-            reason: format!("http_status: {status}"),
-            http_status: Some(status.as_u16()),
-        })
-    }
-
-    async fn fetch_admin_graphql_introspection(
-        &self,
-        url: &str,
-    ) -> std::result::Result<String, SourceFetchError> {
-        let response = self
-            .client
-            .post(url)
-            .header("content-type", "application/json")
-            .body(
-                serde_json::to_vec(&json!({
-                    "query": ADMIN_GRAPHQL_INTROSPECTION_QUERY
-                }))
-                .map_err(|e| SourceFetchError {
-                    status: "failed".to_string(),
-                    reason: format!("serialize_introspection_query: {e}"),
-                    http_status: None,
-                })?,
-            )
-            .send()
-            .await
-            .map_err(|e| SourceFetchError {
-                status: "failed".to_string(),
-                reason: format!("network_error: {e}"),
-                http_status: None,
-            })?;
-        let status = response.status();
-        if status == StatusCode::OK {
-            return response.text().await.map_err(|e| SourceFetchError {
-                status: "failed".to_string(),
-                reason: format!("network_error: {e}"),
-                http_status: Some(StatusCode::OK.as_u16()),
-            });
-        }
-        Err(SourceFetchError {
-            status: "skipped".to_string(),
-            reason: format!("http_status: {status}"),
-            http_status: Some(status.as_u16()),
-        })
     }
 }
 
