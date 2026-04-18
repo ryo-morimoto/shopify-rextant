@@ -1,4 +1,5 @@
 mod changelog;
+mod domain;
 mod graphql;
 mod map;
 mod markdown;
@@ -13,6 +14,12 @@ use changelog::impact::{
     looks_like_reference_candidate, scheduled_changes_from_entry, surface_from_category,
 };
 use changelog::types::{ChangelogEntryInput, ResolvedImpact, ScheduledChangeRecord};
+use domain::concepts::ConceptRecord;
+use domain::graph::{GraphBuild, GraphEdgeRecord, GraphNodeKey};
+use domain::source::SourceDoc;
+
+pub(crate) use domain::docs::DocRecord;
+pub(crate) use domain::source::SourceFetchError;
 use graphql::resolve::{extract_named_type, markdown_mentions_type, resolve_concept_id};
 use graphql::schema_urls::{
     admin_graphql_direct_proxy_url, concept_id, graphql_concept_kind, graphql_reference_path,
@@ -186,27 +193,6 @@ pub(crate) struct Paths {
     raw: PathBuf,
     tantivy: PathBuf,
     db: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DocRecord {
-    path: String,
-    title: String,
-    url: String,
-    version: Option<String>,
-    doc_type: String,
-    api_surface: Option<String>,
-    content_class: String,
-    content_sha: String,
-    last_verified: String,
-    last_changed: String,
-    freshness: String,
-    references_deprecated: bool,
-    deprecated_refs: Vec<String>,
-    summary_raw: String,
-    reading_time_min: Option<i64>,
-    raw_path: String,
-    source: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2850,58 +2836,6 @@ fn add_tantivy_doc(
         fields.content_ja => content.chars().take(4_000).collect::<String>(),
     ))?;
     Ok(())
-}
-
-#[derive(Debug)]
-struct SourceDoc {
-    url: String,
-    title_hint: Option<String>,
-    content: String,
-    source: String,
-}
-
-#[derive(Debug)]
-pub(crate) struct SourceFetchError {
-    pub(crate) status: String,
-    pub(crate) reason: String,
-    pub(crate) http_status: Option<u16>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ConceptRecord {
-    id: String,
-    kind: String,
-    name: String,
-    version: Option<String>,
-    defined_in_path: Option<String>,
-    deprecated: bool,
-    deprecated_since: Option<String>,
-    deprecation_reason: Option<String>,
-    replaced_by: Option<String>,
-    kind_metadata: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct GraphEdgeRecord {
-    from_type: String,
-    from_id: String,
-    to_type: String,
-    to_id: String,
-    kind: String,
-    weight: f64,
-    source_path: Option<String>,
-}
-
-#[derive(Debug, Default, Serialize)]
-struct GraphBuild {
-    concepts: Vec<ConceptRecord>,
-    edges: Vec<GraphEdgeRecord>,
-}
-
-#[derive(Debug, Clone)]
-struct GraphNodeKey {
-    node_type: String,
-    id: String,
 }
 
 #[derive(Debug)]
