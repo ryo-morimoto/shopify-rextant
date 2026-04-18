@@ -14,7 +14,18 @@ use changelog::impact::{
     candidate_to_doc_path, extract_impact_candidates, impact_affected_types, is_api_version,
     looks_like_reference_candidate, scheduled_changes_from_entry, surface_from_category,
 };
-use changelog::types::{ChangelogEntryInput, ResolvedImpact, ScheduledChangeRecord};
+use changelog::types::{ChangelogEntryInput, ResolvedImpact};
+use db::changelog::{changelog_entry_exists, insert_scheduled_change};
+use db::concepts::{concept_from_row, get_concept, insert_concept};
+use db::coverage::{
+    failed_coverage_rows, insert_coverage_event, update_coverage_failed, update_coverage_repaired,
+};
+use db::docs::{
+    all_docs, count_docs, count_where, doc_from_row, enqueue_version_rebuild, get_doc,
+    indexed_version_exists, mark_docs_deprecated, parse_json_string_vec, refresh_indexed_versions,
+    stale_refresh_candidates, upsert_doc,
+};
+use db::graph::{insert_edge, load_edges};
 use db::meta::{get_meta, set_meta};
 use db::schema::{clear_coverage_reports, clear_graph_tables, init_db, open_db};
 use domain::concepts::ConceptRecord;
@@ -692,12 +703,6 @@ struct CoverageRepairSummary {
     still_failed: usize,
     skipped_policy: usize,
     skipped_disabled: usize,
-}
-
-#[derive(Debug)]
-struct CoverageRepairRow {
-    id: i64,
-    source_url: String,
 }
 
 async fn coverage_repair(paths: &Paths) -> Result<CoverageRepairSummary> {
@@ -1895,36 +1900,6 @@ fn find_concept_by_name(
     .map_err(Into::into)
 }
 
-fn get_concept(conn: &Connection, id: &str) -> Result<Option<ConceptRecord>> {
-    conn.query_row(
-        "
-        SELECT id, kind, name, version, defined_in_path, deprecated, deprecated_since,
-               deprecation_reason, replaced_by, kind_metadata
-        FROM concepts
-        WHERE id = ?1
-        ",
-        params![id],
-        concept_from_row,
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-fn concept_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConceptRecord> {
-    Ok(ConceptRecord {
-        id: row.get(0)?,
-        kind: row.get(1)?,
-        name: row.get(2)?,
-        version: row.get(3)?,
-        defined_in_path: row.get(4)?,
-        deprecated: row.get::<_, i64>(5)? != 0,
-        deprecated_since: row.get(6)?,
-        deprecation_reason: row.get(7)?,
-        replaced_by: row.get(8)?,
-        kind_metadata: row.get(9)?,
-    })
-}
-
 fn expand_graph(
     conn: &Connection,
     start_nodes: &[GraphNodeKey],
@@ -2046,29 +2021,6 @@ fn expand_graph(
         edges,
         suggested_reading_order,
     })
-}
-
-fn load_edges(conn: &Connection) -> Result<Vec<GraphEdgeRecord>> {
-    let mut stmt = conn.prepare(
-        "
-        SELECT from_type, from_id, to_type, to_id, kind, weight, source_path
-        FROM edges
-        ORDER BY from_type, from_id, kind, to_type, to_id
-        ",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(GraphEdgeRecord {
-            from_type: row.get(0)?,
-            from_id: row.get(1)?,
-            to_type: row.get(2)?,
-            to_id: row.get(3)?,
-            kind: row.get(4)?,
-            weight: row.get(5)?,
-            source_path: row.get(6)?,
-        })
-    })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
 }
 
 fn graph_map_node(
@@ -2293,11 +2245,6 @@ pub(crate) fn status(paths: &Paths) -> Result<StatusResponse> {
     })
 }
 
-fn count_docs(conn: &Connection) -> Result<i64> {
-    conn.query_row("SELECT COUNT(*) FROM docs", [], |row| row.get(0))
-        .map_err(Into::into)
-}
-
 fn graph_index_status(paths: &Paths, conn: &Connection) -> Result<GraphIndexStatus> {
     Ok(GraphIndexStatus {
         concept_count: count_where(conn, "concepts", "1=1").unwrap_or(0),
@@ -2380,66 +2327,6 @@ fn changelog_status(conn: &Connection) -> Result<ChangelogStatus> {
     })
 }
 
-fn refresh_indexed_versions(conn: &Connection, docs: &[DocRecord]) -> Result<()> {
-    let mut counts = HashMap::<String, i64>::new();
-    for doc in docs {
-        if doc.api_surface.as_deref() == Some("admin_graphql") {
-            if let Some(version) = &doc.version {
-                *counts.entry(version.clone()).or_insert(0) += 1;
-            }
-        }
-    }
-    conn.execute("DELETE FROM indexed_versions", [])?;
-    for (version, doc_count) in counts {
-        conn.execute(
-            "
-            INSERT INTO indexed_versions(version, api_surface, indexed_at, doc_count)
-            VALUES(?1, 'admin_graphql', ?2, ?3)
-            ON CONFLICT(version) DO UPDATE SET
-              api_surface=excluded.api_surface,
-              indexed_at=excluded.indexed_at,
-              doc_count=excluded.doc_count
-            ",
-            params![version, now_iso(), doc_count],
-        )?;
-    }
-    Ok(())
-}
-
-fn indexed_version_exists(conn: &Connection, version: &str, api_surface: &str) -> Result<bool> {
-    conn.query_row(
-        "
-        SELECT 1 FROM indexed_versions
-        WHERE version = ?1 AND api_surface = ?2
-        ",
-        params![version, api_surface],
-        |_| Ok(()),
-    )
-    .optional()
-    .map(|value| value.is_some())
-    .map_err(Into::into)
-}
-
-fn enqueue_version_rebuild(
-    conn: &Connection,
-    version: &str,
-    api_surface: &str,
-    reason: &str,
-) -> Result<()> {
-    conn.execute(
-        "
-        INSERT INTO version_rebuild_queue(version, api_surface, status, reason, enqueued_at)
-        VALUES(?1, ?2, 'pending', ?3, ?4)
-        ON CONFLICT(version, api_surface) DO UPDATE SET
-          status='pending',
-          reason=excluded.reason,
-          enqueued_at=excluded.enqueued_at
-        ",
-        params![version, api_surface, reason, now_iso()],
-    )?;
-    Ok(())
-}
-
 fn update_doc_freshness_states(conn: &Connection) -> Result<()> {
     let docs = all_docs(conn)?;
     for doc in docs {
@@ -2452,39 +2339,6 @@ fn update_doc_freshness_states(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn stale_refresh_candidates(conn: &Connection, limit: usize) -> Result<Vec<DocRecord>> {
-    let mut stmt = conn.prepare(
-        "SELECT path, title, url, version, doc_type, api_surface, content_class, content_sha,
-                last_verified, last_changed, freshness, references_deprecated, deprecated_refs,
-                summary_raw, reading_time_min, raw_path, source
-         FROM docs
-         WHERE freshness IN ('aging', 'stale')
-         ORDER BY CASE freshness WHEN 'stale' THEN 0 ELSE 1 END, last_verified
-         LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(params![limit as i64], doc_from_row)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn all_docs(conn: &Connection) -> Result<Vec<DocRecord>> {
-    let mut stmt = conn.prepare(
-        "SELECT path, title, url, version, doc_type, api_surface, content_class, content_sha,
-                last_verified, last_changed, freshness, references_deprecated, deprecated_refs,
-                summary_raw, reading_time_min, raw_path, source
-         FROM docs",
-    )?;
-    let rows = stmt.query_map([], doc_from_row)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn count_where(conn: &Connection, table: &str, where_clause: &str) -> Result<i64> {
-    let sql = format!("SELECT COUNT(*) FROM {table} WHERE {where_clause}");
-    conn.query_row(&sql, [], |row| row.get(0))
-        .map_err(Into::into)
 }
 
 fn versions_available(paths: &Paths) -> Result<Vec<String>> {
@@ -2872,17 +2726,6 @@ async fn validate_admin_graphql_version<S: TextSource>(source: &S, version: &str
         .is_some_and(|types| !types.is_empty()))
 }
 
-fn changelog_entry_exists(conn: &Connection, id: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT 1 FROM changelog_entries WHERE id = ?1",
-        params![id],
-        |_| Ok(()),
-    )
-    .optional()
-    .map(|value| value.is_some())
-    .map_err(Into::into)
-}
-
 fn resolve_changelog_impact(
     conn: &Connection,
     entry: &ChangelogEntryInput,
@@ -3048,49 +2891,6 @@ fn insert_changelog_entry(
             now_iso(),
         ],
     )?;
-    Ok(())
-}
-
-fn insert_scheduled_change(conn: &Connection, change: &ScheduledChangeRecord) -> Result<()> {
-    conn.execute(
-        "
-        INSERT INTO scheduled_changes (
-          id, type_name, change, effective_date, migration_hint, source_changelog_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        ON CONFLICT(id) DO NOTHING
-        ",
-        params![
-            change.id,
-            change.type_name,
-            change.change,
-            change.effective_date,
-            change.migration_hint,
-            change.source_changelog_id,
-        ],
-    )?;
-    Ok(())
-}
-
-fn mark_docs_deprecated(conn: &Connection, doc_paths: &[String], refs: &[String]) -> Result<()> {
-    for path in doc_paths {
-        let existing = get_doc(conn, path)?;
-        let mut merged = existing
-            .as_ref()
-            .map(|doc| doc.deprecated_refs.clone())
-            .unwrap_or_default();
-        merged.extend(refs.iter().cloned());
-        merged.sort();
-        merged.dedup();
-        conn.execute(
-            "
-            UPDATE docs
-            SET references_deprecated = 1,
-                deprecated_refs = ?1
-            WHERE path = ?2
-            ",
-            params![serde_json::to_string(&merged)?, path],
-        )?;
-    }
     Ok(())
 }
 
@@ -3579,245 +3379,6 @@ fn store_source_doc(paths: &Paths, source: &SourceDoc) -> Result<DocRecord> {
         raw_path,
         source: source.source.clone(),
     })
-}
-
-fn insert_coverage_event(conn: &Connection, event: &CoverageEvent) -> Result<()> {
-    conn.execute(
-        "
-        INSERT INTO coverage_reports (
-          source, canonical_path, source_url, status, reason, http_status, checked_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        ",
-        params![
-            event.source,
-            event.canonical_path,
-            event.source_url,
-            event.status,
-            event.reason,
-            event.http_status,
-            event.checked_at,
-        ],
-    )?;
-    Ok(())
-}
-
-fn failed_coverage_rows(conn: &Connection) -> Result<Vec<CoverageRepairRow>> {
-    let mut stmt = conn.prepare(
-        "
-        SELECT id, source_url
-        FROM coverage_reports
-        WHERE status = 'failed'
-        ORDER BY checked_at, id
-        ",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(CoverageRepairRow {
-            id: row.get(0)?,
-            source_url: row.get(1)?,
-        })
-    })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn update_coverage_repaired(
-    conn: &Connection,
-    id: i64,
-    candidate: &OnDemandFetchCandidate,
-) -> Result<()> {
-    conn.execute(
-        "
-        UPDATE coverage_reports
-        SET canonical_path = ?1,
-            source_url = ?2,
-            status = 'indexed',
-            reason = NULL,
-            http_status = NULL,
-            checked_at = ?3
-        WHERE id = ?4
-        ",
-        params![
-            candidate.canonical_path,
-            candidate.source_url,
-            now_iso(),
-            id
-        ],
-    )?;
-    Ok(())
-}
-
-fn update_coverage_failed(conn: &Connection, id: i64, reason: &str) -> Result<()> {
-    conn.execute(
-        "
-        UPDATE coverage_reports
-        SET status = 'failed',
-            reason = ?1,
-            checked_at = ?2
-        WHERE id = ?3
-        ",
-        params![reason, now_iso(), id],
-    )?;
-    Ok(())
-}
-
-fn insert_concept(conn: &Connection, concept: &ConceptRecord) -> Result<()> {
-    conn.execute(
-        "
-        INSERT INTO concepts (
-          id, kind, name, version, defined_in_path, deprecated, deprecated_since,
-          deprecation_reason, replaced_by, kind_metadata
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-        ON CONFLICT(id) DO UPDATE SET
-          kind=excluded.kind,
-          name=excluded.name,
-          version=excluded.version,
-          defined_in_path=excluded.defined_in_path,
-          deprecated=excluded.deprecated,
-          deprecated_since=excluded.deprecated_since,
-          deprecation_reason=excluded.deprecation_reason,
-          replaced_by=excluded.replaced_by,
-          kind_metadata=excluded.kind_metadata
-        ",
-        params![
-            concept.id,
-            concept.kind,
-            concept.name,
-            concept.version,
-            concept.defined_in_path,
-            i64::from(concept.deprecated),
-            concept.deprecated_since,
-            concept.deprecation_reason,
-            concept.replaced_by,
-            concept.kind_metadata,
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_edge(conn: &Connection, edge: &GraphEdgeRecord) -> Result<()> {
-    conn.execute(
-        "
-        INSERT INTO edges (
-          from_type, from_id, to_type, to_id, kind, weight, source_path, extracted_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-        ",
-        params![
-            edge.from_type,
-            edge.from_id,
-            edge.to_type,
-            edge.to_id,
-            edge.kind,
-            edge.weight,
-            edge.source_path,
-            now_iso(),
-        ],
-    )?;
-    Ok(())
-}
-
-fn upsert_doc(conn: &Connection, doc: &DocRecord) -> Result<()> {
-    conn.execute(
-        "
-        INSERT INTO docs (
-          path, title, url, version, doc_type, api_surface, content_class, content_sha,
-          last_verified, last_changed, freshness, references_deprecated, deprecated_refs,
-          summary_raw, reading_time_min, raw_path, source
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-        ON CONFLICT(path) DO UPDATE SET
-          title=excluded.title,
-          url=excluded.url,
-          version=excluded.version,
-          doc_type=excluded.doc_type,
-          api_surface=excluded.api_surface,
-          content_class=excluded.content_class,
-          content_sha=excluded.content_sha,
-          last_verified=excluded.last_verified,
-          last_changed=CASE
-            WHEN docs.content_sha = excluded.content_sha THEN docs.last_changed
-            ELSE excluded.last_changed
-          END,
-          freshness=excluded.freshness,
-          references_deprecated=CASE
-            WHEN excluded.references_deprecated != 0 THEN 1
-            ELSE docs.references_deprecated
-          END,
-          deprecated_refs=CASE
-            WHEN excluded.deprecated_refs IS NOT NULL AND excluded.deprecated_refs != '[]'
-              THEN excluded.deprecated_refs
-            ELSE docs.deprecated_refs
-          END,
-          summary_raw=excluded.summary_raw,
-          reading_time_min=excluded.reading_time_min,
-          raw_path=excluded.raw_path,
-          source=CASE
-            WHEN docs.source = 'llms' AND excluded.source IN ('sitemap', 'on_demand', 'fixture') THEN docs.source
-            WHEN docs.source = 'sitemap' AND excluded.source IN ('on_demand', 'fixture') THEN docs.source
-            WHEN docs.source = 'on_demand' AND excluded.source = 'fixture' THEN docs.source
-            ELSE excluded.source
-          END
-        ",
-        params![
-            doc.path,
-            doc.title,
-            doc.url,
-            doc.version,
-            doc.doc_type,
-            doc.api_surface,
-            doc.content_class,
-            doc.content_sha,
-            doc.last_verified,
-            doc.last_changed,
-            doc.freshness,
-            i64::from(doc.references_deprecated),
-            serde_json::to_string(&doc.deprecated_refs)?,
-            doc.summary_raw,
-            doc.reading_time_min,
-            doc.raw_path,
-            doc.source,
-        ],
-    )?;
-    Ok(())
-}
-
-fn get_doc(conn: &Connection, path: &str) -> Result<Option<DocRecord>> {
-    conn.query_row(
-        "SELECT path, title, url, version, doc_type, api_surface, content_class, content_sha,
-                last_verified, last_changed, freshness, references_deprecated, deprecated_refs,
-                summary_raw, reading_time_min, raw_path, source
-         FROM docs WHERE path = ?1",
-        params![path],
-        doc_from_row,
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-fn doc_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocRecord> {
-    Ok(DocRecord {
-        path: row.get(0)?,
-        title: row.get(1)?,
-        url: row.get(2)?,
-        version: row.get(3)?,
-        doc_type: row.get(4)?,
-        api_surface: row.get(5)?,
-        content_class: row.get(6)?,
-        content_sha: row.get(7)?,
-        last_verified: row.get(8)?,
-        last_changed: row.get(9)?,
-        freshness: row.get(10)?,
-        references_deprecated: row.get::<_, i64>(11)? != 0,
-        deprecated_refs: parse_json_string_vec(row.get::<_, Option<String>>(12)?.as_deref()),
-        summary_raw: row.get(13)?,
-        reading_time_min: row.get(14)?,
-        raw_path: row.get(15)?,
-        source: row.get(16)?,
-    })
-}
-
-fn parse_json_string_vec(value: Option<&str>) -> Vec<String> {
-    value
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-        .unwrap_or_default()
 }
 
 fn staleness(doc: &DocRecord) -> Staleness {
