@@ -34,6 +34,7 @@ available.
 Run this before submitting implementation changes:
 
 ```bash
+cargo fmt --check
 cargo test
 ```
 
@@ -72,13 +73,19 @@ For a public release candidate:
 
 1. Confirm `Cargo.toml` package version matches the intended tag.
 2. Confirm `shopify-rextant --version`, `shopify-rextant version`, and HTTP User-Agent use the same package version.
-3. Run `cargo test`.
-4. Run `cargo bench --bench release_contract`.
-5. Run an MCP direct stdio smoke test.
-6. Run `cargo package --list` and check that only intended files are included.
-7. Run `cargo package`.
-8. Update README install instructions if crates.io, Homebrew, GitHub Releases, or Nix are available.
-9. Cut the release tag only after CI, packaging, and security checks pass.
+3. Run `cargo fmt --check`.
+4. Run `cargo test`.
+5. Run `cargo bench --bench release_contract -- --test` for the CI benchmark compile gate.
+6. Run `cargo bench --bench release_contract` before cutting a release when you need fresh timing numbers.
+7. Run an MCP direct stdio smoke test.
+8. Run `cargo package --list` and check that only intended files are included.
+9. Run `cargo package`.
+10. Update README install instructions if crates.io, Homebrew, GitHub Releases, or Nix are available.
+11. Cut the release tag only after CI, packaging, and security checks pass.
+
+The GitHub Actions CI gate mirrors the fast local release checks: formatting, tests,
+benchmark compilation, package verification, release binary build, and a newline-delimited
+MCP `initialize` smoke test.
 
 ## Git
 

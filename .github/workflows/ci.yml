@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-gate:
+    name: release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Compile release benchmark
+        run: cargo bench --bench release_contract -- --test
+
+      - name: Check package contents
+        run: cargo package --list
+
+      - name: Verify package
+        run: cargo package
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: MCP initialize smoke
+        run: |
+          set -euo pipefail
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"0"}}}' \
+            | target/release/shopify-rextant serve --direct \
+            | tee /tmp/shopify-rextant-mcp-initialize.json
+          grep -q '"result"' /tmp/shopify-rextant-mcp-initialize.json
+          grep -q '"name":"shopify-rextant"' /tmp/shopify-rextant-mcp-initialize.json

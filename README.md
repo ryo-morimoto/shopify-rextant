@@ -29,7 +29,7 @@ Still pending for public release:
 - GitHub release workflow and checksums
 - Homebrew and Nix install paths
 - Final public install docs
-- Security and performance release gates
+- Security, E2E, and performance-threshold release gates
 
 ## Install From Source
 
@@ -129,8 +129,11 @@ private project files, MCP client metadata, or telemetry.
 Before releasing or opening a PR, run:
 
 ```bash
+cargo fmt --check
 cargo test
-cargo bench --bench release_contract
+cargo bench --bench release_contract -- --test
+cargo package --list
+cargo package
 ```
 
 When changing MCP transport, also run a direct newline-delimited JSON smoke test:
