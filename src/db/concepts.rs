@@ -18,6 +18,34 @@ pub(crate) fn get_concept(conn: &Connection, id: &str) -> Result<Option<ConceptR
     .map_err(Into::into)
 }
 
+pub(crate) fn find_concept_by_name(
+    conn: &Connection,
+    name: &str,
+    version: Option<&str>,
+) -> Result<Option<ConceptRecord>> {
+    conn.query_row(
+        "
+        SELECT id, kind, name, version, defined_in_path, deprecated, deprecated_since,
+               deprecation_reason, replaced_by, kind_metadata
+        FROM concepts
+        WHERE name = ?1
+          AND (?2 IS NULL OR version = ?2)
+        ORDER BY
+          CASE kind
+            WHEN 'graphql_type' THEN 0
+            WHEN 'graphql_input_object' THEN 1
+            ELSE 2
+          END,
+          id
+        LIMIT 1
+        ",
+        params![name, version],
+        concept_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub(crate) fn insert_concept(conn: &Connection, concept: &ConceptRecord) -> Result<()> {
     conn.execute(
         "
