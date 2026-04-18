@@ -1,4 +1,5 @@
 mod changelog;
+pub mod cli;
 mod db;
 mod domain;
 mod graphql;
@@ -11,6 +12,8 @@ mod search;
 mod source;
 mod url_policy;
 mod util;
+
+pub use cli::run;
 
 use changelog::poll::{check_new_versions_from_source, poll_changelog_from_source};
 use db::concepts::{find_concept_by_name, get_concept, insert_concept};
@@ -59,27 +62,24 @@ use url_policy::{
     extract_version, is_indexable_shopify_url, raw_doc_candidates, raw_path_for, reading_time_min,
 };
 use util::hash::hex_sha256;
-use util::json::{merge_json_arrays, print_json};
+use util::json::merge_json_arrays;
 #[cfg(test)]
 use util::json::to_json_value;
 use util::time::now_iso;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
 #[cfg(test)]
 use mcp_framing::{read_message as read_mcp_message, write_json as write_mcp_message};
 use on_demand::{
     FetchCandidate as OnDemandFetchCandidate, FetchPolicy as OnDemandFetchPolicy,
     is_allowed_path as is_on_demand_allowed_path,
 };
-use mcp::daemon::{run_daemon, serve};
 #[cfg(test)]
 use mcp::daemon::{DaemonIdentity, DaemonPaths};
 use mcp::protocol::json_rpc_error;
 #[cfg(test)]
 use mcp::protocol::handle_mcp_request;
-use mcp::server::serve_direct;
 use search::index_io::{
     add_tantivy_doc, create_or_reset_index, rebuild_tantivy_from_db, upsert_tantivy_doc,
 };
@@ -94,7 +94,6 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
 use tantivy::doc;
 
 const SHOPIFY_LLMS_URL: &str = "https://shopify.dev/llms.txt";
@@ -143,69 +142,6 @@ query ShopifyRextantIntrospection {
   }
 }
 "#;
-
-#[derive(Debug, Parser)]
-#[command(name = "shopify-rextant")]
-#[command(version)]
-#[command(about = "Local Shopify docs map MCP server")]
-struct Cli {
-    #[arg(long, env = "SHOPIFY_REXTANT_HOME")]
-    home: Option<PathBuf>,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    Serve {
-        #[arg(long)]
-        direct: bool,
-    },
-    #[command(hide = true)]
-    Daemon {
-        #[arg(long, default_value_t = 600)]
-        idle_timeout_secs: u64,
-    },
-    Build {
-        #[arg(long)]
-        force: bool,
-        #[arg(long)]
-        limit: Option<usize>,
-    },
-    Refresh {
-        path: Option<String>,
-        #[arg(long)]
-        url: Option<String>,
-    },
-    Coverage {
-        #[command(subcommand)]
-        command: CoverageCommand,
-    },
-    Status,
-    Search {
-        query: String,
-        #[arg(long)]
-        version: Option<String>,
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-    },
-    Show {
-        path: String,
-        #[arg(long)]
-        anchor: Option<String>,
-        #[arg(long, default_value_t = true)]
-        include_code_blocks: bool,
-        #[arg(long)]
-        max_chars: Option<usize>,
-    },
-    Version,
-}
-
-#[derive(Debug, Subcommand)]
-enum CoverageCommand {
-    Repair,
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
@@ -336,59 +272,6 @@ impl Default for IndexSourceUrls {
     }
 }
 
-pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let paths = Paths::new(cli.home)?;
-
-    match cli.command {
-        Command::Serve { direct } => {
-            if direct {
-                serve_direct(paths).await
-            } else {
-                serve(paths).await
-            }
-        }
-        Command::Daemon { idle_timeout_secs } => {
-            run_daemon(paths, Duration::from_secs(idle_timeout_secs)).await
-        }
-        Command::Build { force, limit } => build_index(&paths, force, limit).await,
-        Command::Refresh { path, url } => refresh(&paths, path, url).await,
-        Command::Coverage {
-            command: CoverageCommand::Repair,
-        } => print_json(&coverage_repair(&paths).await?),
-        Command::Status => print_json(&status(&paths)?),
-        Command::Search {
-            query,
-            version,
-            limit,
-        } => print_json(&search_docs(&paths, &query, version.as_deref(), limit)?),
-        Command::Show {
-            path,
-            anchor,
-            include_code_blocks,
-            max_chars,
-        } => {
-            let response = shopify_fetch(
-                &paths,
-                &FetchArgs {
-                    path: Some(path),
-                    url: None,
-                    anchor,
-                    include_code_blocks: Some(include_code_blocks),
-                    max_chars,
-                },
-            )
-            .await?;
-            println!("{}", response.content);
-            Ok(())
-        }
-        Command::Version => {
-            println!("shopify-rextant {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
-    }
-}
-
 impl Paths {
     pub(crate) fn new(home: Option<PathBuf>) -> Result<Self> {
         let home = match home {
@@ -470,7 +353,7 @@ fn ensure_on_demand_enabled(
     }
 }
 
-async fn build_index(paths: &Paths, force: bool, limit: Option<usize>) -> Result<()> {
+pub(crate) async fn build_index(paths: &Paths, force: bool, limit: Option<usize>) -> Result<()> {
     let source = ReqwestTextSource::new()?;
     build_index_from_sources(paths, force, limit, &IndexSourceUrls::default(), &source).await
 }
@@ -579,7 +462,7 @@ pub(crate) async fn build_index_from_sources<S: TextSource>(
     Ok(())
 }
 
-async fn refresh(paths: &Paths, path: Option<String>, url: Option<String>) -> Result<()> {
+pub(crate) async fn refresh(paths: &Paths, path: Option<String>, url: Option<String>) -> Result<()> {
     let source = ReqwestTextSource::new()?;
     match (path, url) {
         (Some(_), Some(_)) => bail!("refresh accepts either PATH or --url, not both"),
@@ -609,7 +492,7 @@ struct CoverageRepairSummary {
     skipped_disabled: usize,
 }
 
-async fn coverage_repair(paths: &Paths) -> Result<CoverageRepairSummary> {
+pub(crate) async fn coverage_repair(paths: &Paths) -> Result<CoverageRepairSummary> {
     let source = ReqwestTextSource::new()?;
     coverage_repair_from_source(paths, &source).await
 }
