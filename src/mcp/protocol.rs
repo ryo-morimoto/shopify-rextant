@@ -1,14 +1,14 @@
 use serde_json::{Value, json};
 
 #[cfg(test)]
-use anyhow::{Result, anyhow};
-#[cfg(test)]
 use super::super::util::json::to_json_value;
 #[cfg(test)]
 use super::super::{
     FetchArgs, MapArgs, Paths, SearchArgs, ToolError, search_docs, shopify_fetch, shopify_map,
     status,
 };
+#[cfg(test)]
+use anyhow::{Result, anyhow};
 
 pub(crate) fn json_rpc_error(code: i64, message: &str, data: Value) -> Value {
     json!({ "code": code, "message": message, "data": data })

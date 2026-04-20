@@ -2,9 +2,11 @@ use std::fs;
 
 use anyhow::{Result, bail};
 
-use super::on_demand::{FetchCandidate as OnDemandFetchCandidate, FetchPolicy as OnDemandFetchPolicy};
 use super::Paths;
 use super::ToolError;
+use super::on_demand::{
+    FetchCandidate as OnDemandFetchCandidate, FetchPolicy as OnDemandFetchPolicy,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppConfig {

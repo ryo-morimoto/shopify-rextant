@@ -15,11 +15,7 @@ pub(crate) fn is_doc_like_query(value: &str) -> bool {
     value.starts_with("/docs/") || value.starts_with("/changelog") || value == "/llms.txt"
 }
 
-pub(crate) fn graph_query_plan(
-    paths: &[String],
-    lens: &str,
-    radius: usize,
-) -> Vec<QueryPlanStep> {
+pub(crate) fn graph_query_plan(paths: &[String], lens: &str, radius: usize) -> Vec<QueryPlanStep> {
     paths
         .iter()
         .take(3)

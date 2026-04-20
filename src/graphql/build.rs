@@ -4,15 +4,13 @@ use std::fs;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use super::super::Paths;
 use super::super::domain::concepts::ConceptRecord;
 use super::super::domain::graph::{GraphBuild, GraphEdgeRecord};
 use super::super::domain::source::SourceDoc;
 use super::super::markdown::parse_markdown_links;
 use super::super::source::text_source::TextSource;
-use super::super::url_policy::{
-    canonical_doc_path, classify_api_surface, extract_version,
-};
-use super::super::Paths;
+use super::super::url_policy::{canonical_doc_path, classify_api_surface, extract_version};
 use super::resolve::{extract_named_type, markdown_mentions_type, resolve_concept_id};
 use super::schema_urls::{
     admin_graphql_direct_proxy_url, concept_id, graphql_concept_kind, graphql_reference_path,

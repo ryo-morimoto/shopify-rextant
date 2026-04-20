@@ -25,35 +25,33 @@ mod util;
 pub use cli::run;
 
 pub(crate) use build::build_index;
-pub(crate) use changelog::poll::check_new_versions_from_source;
-pub(crate) use coverage::coverage_repair;
-pub(crate) use fetch::shopify_fetch;
-#[allow(unused_imports)]
-pub(crate) use map_runtime::{shopify_map, shopify_map_with_runtime};
-pub(crate) use refresh::refresh;
-pub(crate) use search::runtime::{search_docs, search_docs_with_runtime};
-pub(crate) use status::status;
-#[cfg(test)]
-use config::load_config;
 #[cfg(test)]
 pub(crate) use build::build_index_from_sources;
+pub(crate) use changelog::poll::check_new_versions_from_source;
 #[cfg(test)]
 use changelog::poll::poll_changelog_from_source;
 #[cfg(test)]
+use config::load_config;
+pub(crate) use coverage::coverage_repair;
+#[cfg(test)]
 use coverage::coverage_repair_from_source;
+pub(crate) use fetch::shopify_fetch;
 #[cfg(test)]
 use fetch::shopify_fetch_from_source;
+#[allow(unused_imports)]
+pub(crate) use map_runtime::{shopify_map, shopify_map_with_runtime};
+pub(crate) use refresh::refresh;
 #[cfg(test)]
 use refresh::{refresh_stale_docs_from_source, refresh_url_from_source};
+pub(crate) use search::runtime::{search_docs, search_docs_with_runtime};
 #[cfg(test)]
 use source_sync::store_source_doc;
+pub(crate) use status::status;
 
 #[cfg(test)]
-use status::coverage_status;
+use db::concepts::insert_concept;
 #[cfg(test)]
 use db::coverage::insert_coverage_event;
-#[cfg(test)]
-use db::concepts::insert_concept;
 #[cfg(test)]
 use db::docs::{count_docs, refresh_indexed_versions, upsert_doc};
 #[cfg(test)]
@@ -72,6 +70,8 @@ use domain::coverage::CoverageEvent;
 use domain::graph::GraphEdgeRecord;
 #[cfg(test)]
 use domain::source::SourceDoc;
+#[cfg(test)]
+use status::coverage_status;
 
 pub(crate) use domain::docs::DocRecord;
 pub(crate) use domain::source::SourceFetchError;
@@ -95,27 +95,27 @@ use anyhow::{Result, anyhow};
 #[cfg(test)]
 use chrono::Utc;
 #[cfg(test)]
+use mcp::daemon::{DaemonIdentity, DaemonPaths};
+#[cfg(test)]
+use mcp::protocol::handle_mcp_request;
+use mcp::protocol::json_rpc_error;
+#[cfg(test)]
 use mcp_framing::{read_message as read_mcp_message, write_json as write_mcp_message};
 use on_demand::FetchCandidate as OnDemandFetchCandidate;
 #[cfg(test)]
 use on_demand::FetchPolicy as OnDemandFetchPolicy;
 #[cfg(test)]
-use mcp::daemon::{DaemonIdentity, DaemonPaths};
-use mcp::protocol::json_rpc_error;
+use rusqlite::Connection;
 #[cfg(test)]
-use mcp::protocol::handle_mcp_request;
+use rusqlite::params;
 #[cfg(test)]
 use search::index_io::rebuild_tantivy_from_db;
 #[cfg(test)]
-use rusqlite::Connection;
-#[cfg(test)]
 use search::schema::SearchFields;
-#[allow(unused_imports)]
-pub(crate) use source::text_source::TextSource;
-#[cfg(test)]
-use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[allow(unused_imports)]
+pub(crate) use source::text_source::TextSource;
 #[cfg(test)]
 use std::fs;
 use std::path::PathBuf;
@@ -193,7 +193,6 @@ pub(crate) struct FetchArgs {
     pub(crate) include_code_blocks: Option<bool>,
     pub(crate) max_chars: Option<usize>,
 }
-
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ToolError {
@@ -298,7 +297,6 @@ impl Paths {
         self.home.join("config.toml")
     }
 }
-
 
 #[cfg(test)]
 mod tests;

@@ -1,5 +1,5 @@
-use super::*;
 use super::changelog::feed::parse_changelog_feed;
+use super::*;
 #[allow(unused_imports)]
 use tantivy::Index;
 #[allow(unused_imports)]
@@ -199,9 +199,8 @@ fn seed_draft_order_graph(paths: &Paths) -> Connection {
         url: "https://shopify.dev/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem.md"
             .to_string(),
         title_hint: Some("DraftOrderLineItem".to_string()),
-        content:
-            "# DraftOrderLineItem\nThe DraftOrderLineItem object includes the grams field.\n"
-                .to_string(),
+        content: "# DraftOrderLineItem\nThe DraftOrderLineItem object includes the grams field.\n"
+            .to_string(),
         source: "sitemap".to_string(),
     };
     let record = store_source_doc(paths, &source).unwrap();
