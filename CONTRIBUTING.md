@@ -1,9 +1,9 @@
 # Contributing
 
-This project is a Rust MCP server for local Shopify developer documentation lookup.
+`shopify-rextant` is a Rust MCP server for local Shopify developer documentation.
 Keep changes source-backed, deterministic, and local-first.
 
-## Development Setup
+## Setup
 
 ```bash
 cargo build
@@ -19,90 +19,38 @@ SHOPIFY_REXTANT_HOME=/tmp/shopify-rextant-dev cargo run -- status
 
 ## Source-First Workflow
 
-Before changing behavior, read the relevant source in this order:
+Read before changing behavior:
 
-1. `SPEC.md`
-2. `src/main.rs`
-3. Existing docs under `docs/`
-4. Official upstream documentation for any external tool or package behavior
+1. [`docs/dev/architecture.md`](docs/dev/architecture.md)
+2. The module under `src/` that implements the behavior.
+3. Official upstream documentation for any external tool or package.
 
-Do not rely on memory for protocol, package, or release behavior when a primary source is
-available.
+Do not rely on memory for protocol, package, or release behavior when a primary source is available.
 
-## Validation Expectations
+## Validation
 
-Run this before submitting implementation changes:
+Before submitting a PR:
 
 ```bash
 cargo fmt --check
 cargo test
 ```
 
-When touching MCP transport, also verify direct stdio framing:
+See [`docs/dev/testing.md`](docs/dev/testing.md) for the full test matrix (MCP smoke, benchmarks, package verification).
 
-```bash
-cargo build
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
-  | target/debug/shopify-rextant serve --direct
-```
+## Release
 
-When touching indexing or search coverage, verify a query that previously needed web
-fallback, such as optional access scopes or managed access scopes.
-
-## Benchmarking
-
-Release benchmarks use Criterion against a deterministic local fixture. They do not
-fetch live Shopify docs during measurement.
-
-Run the stable release-contract benchmarks:
-
-```bash
-cargo bench --bench release_contract
-```
-
-The benchmark group covers:
-
-- `status`
-- `search_docs` for a Product query
-- `shopify_map` for the Product concept graph
-- `shopify_fetch` for a local Product doc path
-
-## Release Checklist
-
-For a public release candidate:
-
-1. Confirm `Cargo.toml` package version matches the intended tag.
-2. Confirm `shopify-rextant --version`, `shopify-rextant version`, and HTTP User-Agent use the same package version.
-3. Run `cargo fmt --check`.
-4. Run `cargo test`.
-5. Run `cargo bench --bench release_contract -- --test` for the CI benchmark compile gate.
-6. Run `cargo bench --bench release_contract` before cutting a release when you need fresh timing numbers.
-7. Run an MCP direct stdio smoke test.
-8. Run `cargo package --list` and check that only intended files are included.
-9. Run `cargo package`.
-10. Update README install instructions if crates.io, Homebrew, GitHub Releases, or Nix are available.
-11. Cut the release tag only after CI, packaging, and security checks pass.
-
-The GitHub Actions CI gate mirrors the fast local release checks: formatting, tests,
-benchmark compilation, package verification, release binary build, and a newline-delimited
-MCP `initialize` smoke test.
+See [`docs/dev/release.md`](docs/dev/release.md). CI mirrors the local release gate.
 
 ## Git
 
-Use Conventional Commits:
-
-- `feat:`
-- `fix:`
-- `docs:`
-- `test:`
-- `refactor:`
-- `chore:`
+Use Conventional Commits: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`.
 
 Do not commit local data directories, generated indexes, or the empty `.codex` metadata file.
 
 ## Product Boundary
 
-Keep these out of scope unless `SPEC.md` is explicitly changed first:
+Keep these out of scope unless [`docs/dev/architecture.md`](docs/dev/architecture.md) is changed first:
 
 - Server-side LLM summarization or answer synthesis
 - User code upload or telemetry
