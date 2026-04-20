@@ -59,54 +59,6 @@ fn fixture_sources() -> MockTextSource {
     ])
 }
 
-#[test]
-fn daemon_identity_uses_canonical_home() {
-    let dir = tempfile::tempdir().unwrap();
-    let dotted = Paths::new(Some(dir.path().join("."))).unwrap();
-    let canonical = Paths::new(Some(fs::canonicalize(dir.path()).unwrap())).unwrap();
-
-    let dotted_identity = DaemonIdentity::for_paths(&dotted).unwrap();
-    let canonical_identity = DaemonIdentity::for_paths(&canonical).unwrap();
-
-    assert_eq!(dotted_identity.hash(), canonical_identity.hash());
-}
-
-#[test]
-fn daemon_identity_separates_different_homes_and_config() {
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-    let paths_a = Paths::new(Some(dir_a.path().to_path_buf())).unwrap();
-    let paths_b = Paths::new(Some(dir_b.path().to_path_buf())).unwrap();
-
-    let hash_a = DaemonIdentity::for_paths(&paths_a).unwrap().hash();
-    let hash_b = DaemonIdentity::for_paths(&paths_b).unwrap().hash();
-    assert_ne!(hash_a, hash_b);
-
-    fs::write(
-        paths_a.config_file(),
-        "[index]\nenable_on_demand_fetch = true\n",
-    )
-    .unwrap();
-    let hash_a_with_config = DaemonIdentity::for_paths(&paths_a).unwrap().hash();
-    assert_ne!(hash_a, hash_a_with_config);
-}
-
-#[test]
-fn daemon_socket_path_uses_bounded_hashed_filename() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let daemon_paths = DaemonPaths::for_paths(&paths).unwrap();
-    let filename = daemon_paths
-        .socket
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap();
-
-    assert!(filename.ends_with(".sock"));
-    assert!(filename.len() <= 69);
-    assert!(daemon_paths.socket.as_os_str().len() < 100);
-}
-
 const ADMIN_GRAPHQL_DIRECT_PROXY_2026_04: &str =
     "https://shopify.dev/admin-graphql-direct-proxy/2026-04";
 
@@ -347,126 +299,6 @@ fn minimal_introspection() -> &'static str {
     r#"{"data":{"__schema":{"types":[{"kind":"OBJECT","name":"Product"}]}}}"#
 }
 
-#[test]
-fn parses_shopify_markdown_links() {
-    let links =
-        parse_markdown_links("[Product](/docs/api/admin-graphql/latest/objects/Product)");
-    assert_eq!(links.len(), 1);
-    assert_eq!(
-        links[0].url,
-        "https://shopify.dev/docs/api/admin-graphql/latest/objects/Product"
-    );
-}
-
-#[test]
-fn init_db_creates_v030_changelog_tables() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-
-    let changelog_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM changelog_entries", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let scheduled_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM scheduled_changes", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-
-    assert_eq!(changelog_count, 0);
-    assert_eq!(scheduled_count, 0);
-    assert_eq!(count_where(&conn, "indexed_versions", "1=1").unwrap(), 0);
-    assert_eq!(
-        count_where(&conn, "version_rebuild_queue", "1=1").unwrap(),
-        0
-    );
-}
-
-#[test]
-fn parses_changelog_rss_entry() {
-    let feed = changelog_feed(
-        "DraftOrderLineItem.grams field removed in 2026-07",
-        "Migrate away from grams.",
-        "https://shopify.dev/changelog/draft-order-line-item-grams",
-    );
-
-    let entries = parse_changelog_feed(&feed).unwrap();
-
-    assert_eq!(entries.len(), 1);
-    assert_eq!(
-        entries[0].title,
-        "DraftOrderLineItem.grams field removed in 2026-07"
-    );
-    assert_eq!(
-        entries[0].link,
-        "https://shopify.dev/changelog/draft-order-line-item-grams"
-    );
-    assert!(
-        entries[0]
-            .categories
-            .contains(&"Admin GraphQL API".to_string())
-    );
-}
-
-#[test]
-fn builds_raw_candidates() {
-    let candidates =
-        raw_doc_candidates("https://shopify.dev/docs/api/admin-graphql/latest").unwrap();
-    assert_eq!(
-        candidates[0],
-        "https://shopify.dev/docs/api/admin-graphql/latest.md"
-    );
-    assert_eq!(
-        candidates[1],
-        "https://shopify.dev/docs/api/admin-graphql/latest.txt"
-    );
-    assert_eq!(candidates.len(), 2);
-}
-
-#[test]
-fn classifies_admin_graphql_surface() {
-    assert_eq!(
-        classify_api_surface("/docs/api/admin-graphql/latest/objects/Product").as_deref(),
-        Some("admin_graphql")
-    );
-    assert_eq!(
-        classify_content_class("/docs/api/admin-graphql/latest/objects/Product"),
-        "schema_ref"
-    );
-}
-
-#[test]
-fn classifies_root_api_pages() {
-    assert_eq!(
-        classify_api_surface("/docs/api/admin-graphql").as_deref(),
-        Some("admin_graphql")
-    );
-    assert_eq!(
-        classify_api_surface("/docs/api/storefront").as_deref(),
-        Some("storefront")
-    );
-    assert_eq!(classify_content_class("/docs/api/admin-graphql"), "api_ref");
-    assert_eq!(classify_doc_type("/docs/api/storefront"), "reference");
-}
-
-#[test]
-fn canonical_path_strips_raw_suffix() {
-    let path = canonical_doc_path(
-        "https://shopify.dev/docs/api/admin-graphql/latest/queries/product.txt",
-    )
-    .unwrap();
-    assert_eq!(path, "/docs/api/admin-graphql/latest/queries/product");
-}
-
-#[test]
-fn canonical_path_keeps_llms_txt() {
-    let path = canonical_doc_path("https://shopify.dev/llms.txt").unwrap();
-    assert_eq!(path, "/llms.txt");
-}
-
 fn write_on_demand_config(paths: &Paths, enabled: bool) {
     fs::create_dir_all(paths.config_file().parent().unwrap()).unwrap();
     fs::write(
@@ -476,1573 +308,1801 @@ fn write_on_demand_config(paths: &Paths, enabled: bool) {
     .unwrap();
 }
 
-#[test]
-fn on_demand_config_defaults_to_disabled() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+mod daemon {
+    use super::*;
 
-    let config = load_config(&paths).unwrap();
+    #[test]
+    fn daemon_identity_uses_canonical_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let dotted = Paths::new(Some(dir.path().join("."))).unwrap();
+        let canonical = Paths::new(Some(fs::canonicalize(dir.path()).unwrap())).unwrap();
 
-    assert!(!config.index.enable_on_demand_fetch);
-}
+        let dotted_identity = DaemonIdentity::for_paths(&dotted).unwrap();
+        let canonical_identity = DaemonIdentity::for_paths(&canonical).unwrap();
 
-#[test]
-fn on_demand_policy_normalizes_allowed_urls_and_paths() {
-    let from_url = OnDemandFetchPolicy::candidate_from_input(
-        "https://shopify.dev/docs/apps/build/access-scopes/?utm=1#managed-access-scopes",
-    )
-    .unwrap();
-    assert_eq!(from_url.canonical_path, "/docs/apps/build/access-scopes");
-    assert_eq!(
-        from_url.source_url,
-        "https://shopify.dev/docs/apps/build/access-scopes"
-    );
+        assert_eq!(dotted_identity.hash(), canonical_identity.hash());
+    }
 
-    let from_path =
-        OnDemandFetchPolicy::candidate_from_input("/changelog/managed-access-scopes/").unwrap();
-    assert_eq!(from_path.canonical_path, "/changelog/managed-access-scopes");
-    assert_eq!(
-        from_path.source_url,
-        "https://shopify.dev/changelog/managed-access-scopes"
-    );
-}
+    #[test]
+    fn daemon_identity_separates_different_homes_and_config() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let paths_a = Paths::new(Some(dir_a.path().to_path_buf())).unwrap();
+        let paths_b = Paths::new(Some(dir_b.path().to_path_buf())).unwrap();
 
-#[test]
-fn on_demand_policy_rejects_outside_scope_without_network_candidate() {
-    assert!(
-        OnDemandFetchPolicy::candidate_from_input(
-            "http://shopify.dev/docs/apps/build/app-home"
-        )
-        .is_err()
-    );
-    assert!(
-        OnDemandFetchPolicy::candidate_from_input(
-            "https://example.com/docs/apps/build/app-home"
-        )
-        .is_err()
-    );
-    assert!(OnDemandFetchPolicy::candidate_from_input("https://shopify.dev/partners").is_err());
-}
+        let hash_a = DaemonIdentity::for_paths(&paths_a).unwrap().hash();
+        let hash_b = DaemonIdentity::for_paths(&paths_b).unwrap().hash();
+        assert_ne!(hash_a, hash_b);
 
-#[test]
-fn parses_sitemap_links_for_docs_and_changelog() {
-    let links = parse_sitemap_links(
-        r#"
-        <urlset>
-          <url><loc>https://shopify.dev/docs/apps/build/access-scopes</loc></url>
-          <url><loc>https://shopify.dev/changelog/managed-access-scopes</loc></url>
-          <url><loc>https://shopify.dev/partners</loc></url>
-        </urlset>
-        "#,
-    );
-    assert_eq!(links.len(), 2);
-    assert_eq!(links[0].source, "sitemap");
-    assert_eq!(
-        links[0].url,
-        "https://shopify.dev/docs/apps/build/access-scopes"
-    );
-    assert_eq!(
-        canonical_doc_path(&links[1].url).unwrap(),
-        "/changelog/managed-access-scopes"
-    );
-}
-
-#[test]
-fn extracts_anchor_section_and_removes_code_blocks() {
-    let markdown = "# Intro\nKeep\n\n## Managed access scopes\nText\n```graphql\nquery { shop { name } }\n```\nMore\n\n## Next\nDone\n";
-    let sections = extract_sections(markdown);
-    let scoped = section_content(markdown, &sections, "managed-access-scopes").unwrap();
-    assert!(scoped.contains("## Managed access scopes"));
-    assert!(!scoped.contains("## Next"));
-
-    let without_code = remove_fenced_code_blocks(&scoped);
-    assert!(without_code.contains("Text"));
-    assert!(!without_code.contains("query { shop"));
-    assert!(without_code.contains("More"));
-}
-
-#[tokio::test]
-async fn mcp_fetch_url_disabled_returns_v05_error_contract_without_network() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let response = handle_mcp_request(
-        &paths,
-        serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"tools/call",
-            "params":{
-                "name":"shopify_fetch",
-                "arguments":{
-                    "url":"https://shopify.dev/docs/apps/build/access-scopes"
-                }
-            }
-        }),
-    )
-    .await;
-
-    assert_eq!(response["error"]["code"], -32007);
-    assert_eq!(
-        response["error"]["data"]["candidate_url"],
-        "https://shopify.dev/docs/apps/build/access-scopes"
-    );
-    assert_eq!(
-        response["error"]["data"]["canonical_path"],
-        "/docs/apps/build/access-scopes"
-    );
-    assert_eq!(response["error"]["data"]["enable_on_demand_fetch"], false);
-}
-
-#[tokio::test]
-async fn mcp_fetch_url_outside_scope_returns_policy_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    write_on_demand_config(&paths, true);
-
-    let response = handle_mcp_request(
-        &paths,
-        serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"tools/call",
-            "params":{
-                "name":"shopify_fetch",
-                "arguments":{
-                    "url":"https://shopify.dev/partners"
-                }
-            }
-        }),
-    )
-    .await;
-
-    assert_eq!(response["error"]["code"], -32008);
-    assert!(
-        response["error"]["data"]["allowed_scope"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty())
-    );
-}
-
-#[tokio::test]
-async fn on_demand_fetch_url_stores_raw_doc_upserts_and_indexes() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    write_on_demand_config(&paths, true);
-    let source = MockTextSource::new(&[(
-        "https://shopify.dev/docs/apps/build/on-demand.md",
-        "# On demand\nRecovered optional access scopes content.\n",
-    )]);
-
-    let response = shopify_fetch_from_source(
-        &paths,
-        &FetchArgs {
-            path: None,
-            url: Some(
-                "https://shopify.dev/docs/apps/build/on-demand?from=test#top".to_string(),
-            ),
-            anchor: None,
-            include_code_blocks: None,
-            max_chars: None,
-        },
-        &source,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(response.path, "/docs/apps/build/on-demand");
-    assert!(
-        response
-            .content
-            .contains("Recovered optional access scopes")
-    );
-    let conn = open_db(&paths).unwrap();
-    let stored = get_doc(&conn, "/docs/apps/build/on-demand")
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored.source, "on_demand");
-    assert!(paths.raw_file(&stored.raw_path).exists());
-    let results = search_docs(&paths, "Recovered optional scopes", None, 5).unwrap();
-    assert_eq!(results[0].path, "/docs/apps/build/on-demand");
-
-    let fetched_by_path = shopify_fetch_from_source(
-        &paths,
-        &FetchArgs {
-            path: Some("/docs/apps/build/on-demand".to_string()),
-            url: None,
-            anchor: None,
-            include_code_blocks: None,
-            max_chars: None,
-        },
-        &source,
-    )
-    .await
-    .unwrap();
-    assert_eq!(fetched_by_path.path, "/docs/apps/build/on-demand");
-}
-
-#[tokio::test]
-async fn on_demand_fetch_unindexed_path_derives_official_url() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    write_on_demand_config(&paths, true);
-    let source = MockTextSource::new(&[(
-        "https://shopify.dev/changelog/managed-access-scopes.md",
-        "# Managed access scopes\nChangelog text.\n",
-    )]);
-
-    let response = shopify_fetch_from_source(
-        &paths,
-        &FetchArgs {
-            path: Some("/changelog/managed-access-scopes".to_string()),
-            url: None,
-            anchor: None,
-            include_code_blocks: None,
-            max_chars: None,
-        },
-        &source,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        response.url,
-        "https://shopify.dev/changelog/managed-access-scopes.md"
-    );
-    assert_eq!(response.path, "/changelog/managed-access-scopes");
-}
-
-#[tokio::test]
-async fn on_demand_refresh_preserves_existing_higher_precedence_source() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    write_on_demand_config(&paths, true);
-    fs::create_dir_all(&paths.raw).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    let source_doc = SourceDoc {
-        url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
-        title_hint: Some("Access scopes".to_string()),
-        content: "# Access scopes\nIndexed by sitemap.\n".to_string(),
-        source: "sitemap".to_string(),
-    };
-    let record = store_source_doc(&paths, &source_doc).unwrap();
-    upsert_doc(&conn, &record).unwrap();
-    rebuild_tantivy_from_db(&paths).unwrap();
-    let source = MockTextSource::new(&[(
-        "https://shopify.dev/docs/apps/build/access-scopes.md",
-        "# Access scopes\nRefreshed by on-demand fetch.\n",
-    )]);
-
-    refresh_url_from_source(
-        &paths,
-        "https://shopify.dev/docs/apps/build/access-scopes",
-        &source,
-    )
-    .await
-    .unwrap();
-
-    let refreshed = get_doc(&conn, "/docs/apps/build/access-scopes")
-        .unwrap()
-        .unwrap();
-    assert_eq!(refreshed.source, "sitemap");
-    assert_ne!(refreshed.content_sha, record.content_sha);
-}
-
-#[tokio::test]
-async fn on_demand_refetch_removes_stale_tantivy_terms_for_same_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    write_on_demand_config(&paths, true);
-    let source = MockTextSource::new(&[(
-        "https://shopify.dev/docs/apps/build/delta.md",
-        "# Delta\nFresh replacement term.\n",
-    )]);
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    let old = store_source_doc(
-        &paths,
-        &SourceDoc {
-            url: "https://shopify.dev/docs/apps/build/delta.md".to_string(),
-            title_hint: Some("Delta".to_string()),
-            content: "# Delta\nObsoleteUniqueTerm.\n".to_string(),
-            source: "on_demand".to_string(),
-        },
-    )
-    .unwrap();
-    upsert_doc(&conn, &old).unwrap();
-    rebuild_tantivy_from_db(&paths).unwrap();
-
-    refresh_url_from_source(&paths, "https://shopify.dev/docs/apps/build/delta", &source)
-        .await
-        .unwrap();
-
-    assert!(
-        search_docs(&paths, "Fresh replacement", None, 5)
-            .unwrap()
-            .iter()
-            .any(|doc| doc.path == "/docs/apps/build/delta")
-    );
-    assert!(
-        search_docs(&paths, "ObsoleteUniqueTerm", None, 5)
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn map_zero_results_suggests_allowed_on_demand_candidate_without_fetching() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "https://shopify.dev/docs/apps/build/missing".to_string(),
-            radius: None,
-            lens: None,
-            version: None,
-            max_nodes: Some(5),
-        },
-    )
-    .unwrap();
-
-    let candidate = response
-        .meta
-        .on_demand_candidate
-        .expect("allowed URL-like zero result should produce candidate metadata");
-    assert_eq!(candidate.url, "https://shopify.dev/docs/apps/build/missing");
-    assert!(!candidate.enabled);
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    assert_eq!(count_docs(&conn).unwrap(), 0);
-}
-
-#[tokio::test]
-async fn map_zero_results_does_not_suggest_disallowed_on_demand_candidate() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "https://shopify.dev/partners".to_string(),
-            radius: None,
-            lens: None,
-            version: None,
-            max_nodes: Some(5),
-        },
-    )
-    .unwrap();
-
-    assert!(response.meta.on_demand_candidate.is_none());
-}
-
-#[tokio::test]
-async fn map_nonzero_results_do_not_add_on_demand_candidate() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    fs::create_dir_all(&paths.raw).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    let source = SourceDoc {
-        url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
-        title_hint: Some("Access scopes".to_string()),
-        content: "# Access scopes\nLocal indexed text.\n".to_string(),
-        source: "sitemap".to_string(),
-    };
-    let record = store_source_doc(&paths, &source).unwrap();
-    upsert_doc(&conn, &record).unwrap();
-    rebuild_tantivy_from_db(&paths).unwrap();
-
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "/docs/apps/build/access-scopes".to_string(),
-            radius: None,
-            lens: None,
-            version: None,
-            max_nodes: Some(5),
-        },
-    )
-    .unwrap();
-
-    assert!(!response.nodes.is_empty());
-    assert!(response.meta.on_demand_candidate.is_none());
-}
-
-#[tokio::test]
-async fn coverage_repair_retries_failed_allowed_rows_and_skips_policy_rows() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    write_on_demand_config(&paths, true);
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    insert_coverage_event(
-        &conn,
-        &CoverageEvent {
-            source: "sitemap".to_string(),
-            canonical_path: Some("/docs/apps/build/repairable".to_string()),
-            source_url: "https://shopify.dev/docs/apps/build/repairable".to_string(),
-            status: "failed".to_string(),
-            reason: Some("network_error".to_string()),
-            http_status: None,
-            checked_at: "2026-04-17T00:00:00Z".to_string(),
-        },
-    )
-    .unwrap();
-    insert_coverage_event(
-        &conn,
-        &CoverageEvent {
-            source: "sitemap".to_string(),
-            canonical_path: None,
-            source_url: "https://shopify.dev/partners".to_string(),
-            status: "failed".to_string(),
-            reason: Some("outside_scope".to_string()),
-            http_status: None,
-            checked_at: "2026-04-17T00:00:00Z".to_string(),
-        },
-    )
-    .unwrap();
-    let source = MockTextSource::new(&[(
-        "https://shopify.dev/docs/apps/build/repairable.md",
-        "# Repairable\nRecovered through coverage repair.\n",
-    )]);
-
-    let summary = coverage_repair_from_source(&paths, &source).await.unwrap();
-
-    assert_eq!(summary.attempted, 1);
-    assert_eq!(summary.repaired, 1);
-    assert_eq!(summary.skipped_policy, 1);
-    assert_eq!(
-        get_doc(&conn, "/docs/apps/build/repairable")
-            .unwrap()
-            .unwrap()
-            .source,
-        "on_demand"
-    );
-    assert_eq!(
-        count_where(
-            &conn,
-            "coverage_reports",
-            "source_url = 'https://shopify.dev/docs/apps/build/repairable' AND status = 'indexed'"
-        )
-        .unwrap(),
-        1
-    );
-}
-
-#[tokio::test]
-async fn coverage_repair_disabled_skips_allowed_rows_without_fetching() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    insert_coverage_event(
-        &conn,
-        &CoverageEvent {
-            source: "sitemap".to_string(),
-            canonical_path: Some("/docs/apps/build/disabled-repair".to_string()),
-            source_url: "https://shopify.dev/docs/apps/build/disabled-repair".to_string(),
-            status: "failed".to_string(),
-            reason: Some("network_error".to_string()),
-            http_status: None,
-            checked_at: "2026-04-17T00:00:00Z".to_string(),
-        },
-    )
-    .unwrap();
-    let source = MockTextSource::new(&[(
-        "https://shopify.dev/docs/apps/build/disabled-repair.md",
-        "# Should not fetch\n",
-    )]);
-
-    let summary = coverage_repair_from_source(&paths, &source).await.unwrap();
-
-    assert_eq!(summary.attempted, 0);
-    assert_eq!(summary.skipped_disabled, 1);
-    assert!(
-        get_doc(&conn, "/docs/apps/build/disabled-repair")
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[test]
-fn coverage_status_counts_report_rows() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    insert_coverage_event(
-        &conn,
-        &CoverageEvent {
-            source: "sitemap".to_string(),
-            canonical_path: Some("/docs/apps/build/access-scopes".to_string()),
-            source_url: "https://shopify.dev/docs/apps/build/access-scopes".to_string(),
-            status: "skipped".to_string(),
-            reason: Some("markdown_not_found".to_string()),
-            http_status: Some(404),
-            checked_at: "2026-04-17T00:00:00Z".to_string(),
-        },
-    )
-    .unwrap();
-
-    let coverage = coverage_status(&conn).unwrap();
-    assert_eq!(coverage.discovered_count, 1);
-    assert_eq!(coverage.skipped_count, 1);
-    assert_eq!(coverage.sources.sitemap, 1);
-}
-
-#[test]
-fn sitemap_sourced_optional_scopes_doc_is_searchable() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    fs::create_dir_all(&paths.raw).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    let source = SourceDoc {
-        url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
-        title_hint: Some("Access scopes".to_string()),
-        content: "# Access scopes\nOptional access scopes and managed access scopes let apps request protected permissions.\n".to_string(),
-        source: "sitemap".to_string(),
-    };
-    let record = store_source_doc(&paths, &source).unwrap();
-    upsert_doc(&conn, &record).unwrap();
-    rebuild_tantivy_from_db(&paths).unwrap();
-
-    let results = search_docs(&paths, "optional scopes", None, 5).unwrap();
-    assert_eq!(results[0].path, "/docs/apps/build/access-scopes");
-    assert_eq!(results[0].source, "sitemap");
-}
-
-#[tokio::test]
-async fn changelog_resolved_concept_marks_connected_doc_stale() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let conn = seed_draft_order_graph(&paths);
-    let feed = changelog_feed(
-        "DraftOrderLineItem.grams field removed in 2026-07",
-        "The DraftOrderLineItem.grams field will be removed. Migrate to weight.",
-        "https://shopify.dev/changelog/draft-order-line-item-grams",
-    );
-    let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, &feed)]);
-
-    let report = poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
-        .await
-        .unwrap();
-
-    assert_eq!(report.entries_inserted, 1);
-    assert_eq!(report.entries_seen, 1);
-    assert!(report.warnings.is_empty());
-    assert!(report.scheduled_changes > 0);
-    let doc = get_doc(
-        &conn,
-        "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem",
-    )
-    .unwrap()
-    .unwrap();
-    assert!(doc.references_deprecated);
-    assert!(
-        doc.deprecated_refs
-            .iter()
-            .any(|reference| reference == "DraftOrderLineItem.grams")
-    );
-
-    let fetched = shopify_fetch(
-        &paths,
-        &FetchArgs {
-            path: Some(
-                "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem".to_string(),
-            ),
-            url: None,
-            anchor: None,
-            include_code_blocks: None,
-            max_chars: None,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(fetched.staleness.references_deprecated);
-    assert!(
-        fetched
-            .staleness
-            .upcoming_changes
-            .iter()
-            .any(|change| change["type_name"] == "DraftOrderLineItem.grams")
-    );
-}
-
-#[tokio::test]
-async fn map_doc_node_includes_scheduled_change_staleness() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    seed_draft_order_graph(&paths);
-    let feed = changelog_feed(
-        "DraftOrderLineItem.grams field removed in 2026-07",
-        "The DraftOrderLineItem.grams field will be removed. Migrate to weight.",
-        "https://shopify.dev/changelog/draft-order-line-item-grams-map",
-    );
-    let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, &feed)]);
-    poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
-        .await
-        .unwrap();
-
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem".to_string(),
-            radius: Some(1),
-            lens: Some("doc".to_string()),
-            version: Some("2026-04".to_string()),
-            max_nodes: Some(10),
-        },
-    )
-    .unwrap();
-
-    let doc_node = response
-        .nodes
-        .iter()
-        .find(|node| node.path == "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem")
-        .expect("map response should include the affected doc node");
-    assert!(doc_node.staleness.references_deprecated);
-    assert!(doc_node.staleness.upcoming_changes.iter().any(|change| {
-        change["type_name"] == "DraftOrderLineItem.grams"
-            && change["change"] == "removal"
-            && change["effective_date"] == "2026-07"
-            && change["migration_hint"]
-                .as_str()
-                .is_some_and(|hint| hint.contains("Migrate to weight"))
-    }));
-}
-
-#[tokio::test]
-async fn changelog_unknown_symbol_is_unresolved_and_does_not_mark_docs() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let conn = seed_draft_order_graph(&paths);
-    let feed = changelog_feed(
-        "UnknownType.foo field removed in 2026-07",
-        "The UnknownType.foo field will be removed.",
-        "https://shopify.dev/changelog/unknown-type-field",
-    );
-    let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, &feed)]);
-
-    poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
-        .await
-        .unwrap();
-
-    let unresolved: String = conn
-        .query_row(
-            "SELECT unresolved_affected_refs FROM changelog_entries",
-            [],
-            |row| row.get(0),
+        fs::write(
+            paths_a.config_file(),
+            "[index]\nenable_on_demand_fetch = true\n",
         )
         .unwrap();
-    assert!(
-        parse_json_string_vec(Some(&unresolved))
-            .iter()
-            .any(|reference| reference == "UnknownType.foo")
-    );
-    assert_eq!(count_where(&conn, "scheduled_changes", "1=1").unwrap(), 0);
-    let doc = get_doc(
-        &conn,
-        "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem",
-    )
-    .unwrap()
-    .unwrap();
-    assert!(!doc.references_deprecated);
+        let hash_a_with_config = DaemonIdentity::for_paths(&paths_a).unwrap().hash();
+        assert_ne!(hash_a, hash_a_with_config);
+    }
+
+    #[test]
+    fn daemon_socket_path_uses_bounded_hashed_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let daemon_paths = DaemonPaths::for_paths(&paths).unwrap();
+        let filename = daemon_paths
+            .socket
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+
+        assert!(filename.ends_with(".sock"));
+        assert!(filename.len() <= 69);
+        assert!(daemon_paths.socket.as_os_str().len() < 100);
+    }
 }
 
-#[tokio::test]
-async fn changelog_doc_link_resolves_through_docs_and_edges() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let conn = seed_draft_order_graph(&paths);
-    let feed = changelog_feed(
-        "Draft order docs updated for a removal in 2026-07",
-        "See https://shopify.dev/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem for the removal.",
-        "https://shopify.dev/changelog/draft-order-doc-removal",
-    );
-    let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, &feed)]);
+mod parsers {
+    use super::*;
 
-    poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
-        .await
-        .unwrap();
+    #[test]
+    fn parses_shopify_markdown_links() {
+        let links =
+            parse_markdown_links("[Product](/docs/api/admin-graphql/latest/objects/Product)");
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].url,
+            "https://shopify.dev/docs/api/admin-graphql/latest/objects/Product"
+        );
+    }
 
-    let affected: String = conn
-        .query_row("SELECT affected_types FROM changelog_entries", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let affected = parse_json_string_vec(Some(&affected));
-    assert!(affected.iter().any(|reference| {
-        reference == "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem"
-    }));
-    assert!(
-        affected
-            .iter()
-            .any(|reference| reference == "DraftOrderLineItem.grams")
-    );
-    let doc = get_doc(
-        &conn,
-        "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem",
-    )
-    .unwrap()
-    .unwrap();
-    assert!(doc.references_deprecated);
-}
+    #[test]
+    fn parses_changelog_rss_entry() {
+        let feed = changelog_feed(
+            "DraftOrderLineItem.grams field removed in 2026-07",
+            "Migrate away from grams.",
+            "https://shopify.dev/changelog/draft-order-line-item-grams",
+        );
 
-#[tokio::test]
-async fn status_reports_freshness_workers_and_changelog_counts() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let _conn = seed_draft_order_graph(&paths);
-    let feed = changelog_feed(
-        "DraftOrderLineItem.grams field removed in 2026-07",
-        "The DraftOrderLineItem.grams field will be removed.",
-        "https://shopify.dev/changelog/draft-order-status",
-    );
-    let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, &feed)]);
+        let entries = parse_changelog_feed(&feed).unwrap();
 
-    poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
-        .await
-        .unwrap();
-    refresh_stale_docs_from_source(&paths, &source)
-        .await
-        .unwrap();
-    let status = status(&paths).unwrap();
-
-    assert_eq!(status.changelog.entry_count, 1);
-    assert!(status.changelog.scheduled_change_count > 0);
-    assert!(status.workers.last_changelog_at.is_some());
-    assert!(status.workers.last_aging_sweep_at.is_some());
-    assert_eq!(status.freshness.fresh_count, 1);
-}
-
-#[tokio::test]
-async fn status_reports_changelog_polling_warning() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, "not an rss feed")]);
-
-    let report = poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
-        .await
-        .unwrap();
-
-    assert_eq!(report.entries_inserted, 0);
-    assert_eq!(report.warnings.len(), 1);
-    let status = status(&paths).unwrap();
-    assert!(status.changelog.last_warning.is_some());
-    assert!(
-        status
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("Changelog polling warning"))
-    );
-}
-
-#[tokio::test]
-async fn version_watcher_enqueues_validated_unindexed_latest_version() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    let source = MockTextSource::new(&[
-        (
-            SHOPIFY_VERSIONING_URL,
-            "Stable version Release date Supported until 2026-04 April 1 2026 2026-07 July 1 2026",
-        ),
-        (
-            &admin_graphql_direct_proxy_url("2026-07"),
-            minimal_introspection(),
-        ),
-    ]);
-
-    let report = check_new_versions_from_source(&paths, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    assert_eq!(report.latest_candidate.as_deref(), Some("2026-07"));
-    assert!(report.enqueued);
-    assert!(get_meta(&conn, "last_version_check_at").unwrap().is_some());
-    assert_eq!(
-        count_where(
-            &conn,
-            "version_rebuild_queue",
-            "version = '2026-07' AND api_surface = 'admin_graphql' AND status = 'pending'"
-        )
-        .unwrap(),
-        1
-    );
-    let status = status(&paths).unwrap();
-    assert!(
-        status
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("version rebuild request"))
-    );
-}
-
-#[tokio::test]
-async fn version_watcher_does_not_enqueue_already_indexed_latest_version() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    fs::create_dir_all(&paths.raw).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    let source_doc = SourceDoc {
-        url: "https://shopify.dev/docs/api/admin-graphql/2026-07/objects/Product.md"
-            .to_string(),
-        title_hint: Some("Product".to_string()),
-        content: "# Product\nCurrent product reference.\n".to_string(),
-        source: "sitemap".to_string(),
-    };
-    let record = store_source_doc(&paths, &source_doc).unwrap();
-    upsert_doc(&conn, &record).unwrap();
-    refresh_indexed_versions(&conn, &[record]).unwrap();
-    let source = MockTextSource::new(&[(
-        SHOPIFY_VERSIONING_URL,
-        "Stable version Release date Supported until 2026-04 April 1 2026 2026-07 July 1 2026",
-    )]);
-
-    let report = check_new_versions_from_source(&paths, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    assert_eq!(report.latest_candidate.as_deref(), Some("2026-07"));
-    assert!(report.already_indexed);
-    assert!(!report.enqueued);
-    assert_eq!(
-        count_where(&conn, "version_rebuild_queue", "1=1").unwrap(),
-        0
-    );
-}
-
-#[tokio::test]
-async fn version_watcher_rejects_html_only_candidate_without_schema_validation() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    let source = MockTextSource::new(&[(
-        SHOPIFY_VERSIONING_URL,
-        "Stable version Release date Supported until 2026-10 October 1 2026",
-    )]);
-
-    let report = check_new_versions_from_source(&paths, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    assert_eq!(report.latest_candidate, None);
-    assert!(!report.enqueued);
-    assert!(report.warning.is_some());
-    assert_eq!(
-        count_where(&conn, "version_rebuild_queue", "1=1").unwrap(),
-        0
-    );
-}
-
-#[test]
-fn reads_newline_delimited_mcp_message() {
-    let input = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}
-"#;
-    let mut reader = std::io::BufReader::new(&input[..]);
-    let message = read_mcp_message(&mut reader).unwrap().unwrap();
-    let value: serde_json::Value = serde_json::from_slice(&message).unwrap();
-    assert_eq!(value["method"], "tools/list");
-}
-
-#[test]
-fn writes_newline_delimited_mcp_message() {
-    let mut output = Vec::new();
-    write_mcp_message(
-        &mut output,
-        &serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}),
-    )
-    .unwrap();
-    assert!(output.ends_with(b"\n"));
-    assert!(!output.starts_with(b"Content-Length:"));
-}
-
-#[tokio::test]
-async fn mcp_initialize_tools_status_sequence_is_fast() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let started = std::time::Instant::now();
-    let initialize = handle_mcp_request(
-        &paths,
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
-    )
-    .await;
-    let elapsed = started.elapsed();
-    assert!(elapsed.as_millis() < 20);
-    assert_eq!(
-        initialize["result"]["serverInfo"]["name"],
-        "shopify-rextant"
-    );
-
-    let tools = handle_mcp_request(
-        &paths,
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-    )
-    .await;
-    assert_eq!(tools["result"]["tools"][0]["name"], "shopify_map");
-
-    let status = handle_mcp_request(
-        &paths,
-        serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{"name":"shopify_status","arguments":{}}
-        }),
-    )
-    .await;
-    assert_eq!(
-        status["result"]["structuredContent"]["schema_version"],
-        SCHEMA_VERSION
-    );
-}
-
-#[tokio::test]
-async fn full_build_uses_llms_and_sitemap_union_from_mock_sources() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = fixture_sources();
-
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let conn = open_db(&paths).unwrap();
-    assert_eq!(count_docs(&conn).unwrap(), 3);
-    let admin_root = get_doc(&conn, "/docs/api/admin-graphql").unwrap().unwrap();
-    assert_eq!(admin_root.source, "llms");
-    let access_scopes = get_doc(&conn, "/docs/apps/build/access-scopes")
-        .unwrap()
-        .unwrap();
-    assert_eq!(access_scopes.source, "sitemap");
-
-    let coverage = coverage_status(&conn).unwrap();
-    assert_eq!(coverage.discovered_count, 2);
-    assert_eq!(coverage.indexed_count, 2);
-    assert_eq!(coverage.sources.llms, 1);
-    assert_eq!(coverage.sources.sitemap, 1);
-
-    let results = search_docs(&paths, "optional scopes", None, 5).unwrap();
-    assert_eq!(results[0].path, "/docs/apps/build/access-scopes");
-}
-
-#[tokio::test]
-async fn search_docs_uses_lindera_for_japanese_queries_without_regressing_english() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = admin_graphql_graph_sources();
-
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let japanese_results = search_docs(&paths, "割引 クーポン", Some("2026-04"), 5).unwrap();
-    assert!(
-        japanese_results
-            .iter()
-            .any(|doc| doc.path == "/docs/apps/build/discounts/cart-level"),
-        "Japanese discount/coupon query should reach the cart-level discount doc: {:?}",
-        japanese_results
-            .iter()
-            .map(|doc| doc.path.as_str())
-            .collect::<Vec<_>>()
-    );
-
-    let english_results = search_docs(&paths, "Product", Some("2026-04"), 5).unwrap();
-    assert!(
-        english_results
-            .iter()
-            .any(|doc| doc.path == "/docs/api/admin-graphql/2026-04/objects/Product"),
-        "English type-name search should continue to reach Product docs: {:?}",
-        english_results
-            .iter()
-            .map(|doc| doc.path.as_str())
-            .collect::<Vec<_>>()
-    );
-}
-
-#[tokio::test]
-async fn build_recreates_legacy_tantivy_index_when_search_schema_changes() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    fs::create_dir_all(&paths.tantivy).unwrap();
-    let mut legacy_builder = Schema::builder();
-    legacy_builder.add_text_field("path", STRING | STORED);
-    legacy_builder.add_text_field("title", TEXT | STORED);
-    legacy_builder.add_text_field("url", STRING | STORED);
-    legacy_builder.add_text_field("version", STRING | STORED);
-    legacy_builder.add_text_field("api_surface", STRING | STORED);
-    legacy_builder.add_text_field("doc_type", STRING | STORED);
-    legacy_builder.add_text_field("content", TEXT);
-    let legacy_index = Index::create_in_dir(&paths.tantivy, legacy_builder.build()).unwrap();
-    legacy_index
-        .writer::<TantivyDocument>(50_000_000)
-        .unwrap()
-        .commit()
-        .unwrap();
-    assert!(
-        SearchFields::from_schema(&legacy_index.schema()).is_err(),
-        "legacy index fixture should not contain v0.4 content_en/content_ja fields"
-    );
-
-    let source = admin_graphql_graph_sources();
-    build_index_from_sources(&paths, false, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let index = Index::open_in_dir(&paths.tantivy).unwrap();
-    assert!(
-        SearchFields::from_schema(&index.schema()).is_ok(),
-        "build should recreate old Tantivy indexes with the current search schema"
-    );
-    let japanese_results = search_docs(&paths, "割引 クーポン", Some("2026-04"), 5).unwrap();
-    assert!(
-        japanese_results
-            .iter()
-            .any(|doc| doc.path == "/docs/apps/build/discounts/cart-level"),
-        "recreated index should support Japanese search"
-    );
-}
-
-#[tokio::test]
-async fn full_build_indexes_admin_graphql_concepts_edges_and_status_graph_counts() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = admin_graphql_graph_sources();
-
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let schema_snapshot = paths
-        .data
-        .join("schemas/admin-graphql/2026-04.introspection.json");
-    assert!(
-        schema_snapshot.exists(),
-        "v0.2.0 build must persist the Admin GraphQL introspection snapshot at {}",
-        schema_snapshot.display()
-    );
-
-    let conn = open_db(&paths).unwrap();
-    let concept_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM concepts", [], |row| row.get(0))
-        .unwrap();
-    let edge_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
-        .unwrap();
-    assert!(
-        concept_count >= 3,
-        "expected Product, ProductVariant, and ProductInput concepts, got {concept_count}"
-    );
-    assert!(
-        edge_count >= 3,
-        "expected defined_in/has_field/returns edges, got {edge_count}"
-    );
-
-    let status_json = to_json_value(status(&paths).unwrap());
-    assert!(
-        status_json
-            .pointer("/index/concept_count")
-            .and_then(Value::as_i64)
-            .is_some_and(|count| count > 0),
-        "shopify_status must expose index.concept_count: {status_json:#}"
-    );
-    assert!(
-        status_json
-            .pointer("/index/edge_count")
-            .and_then(Value::as_i64)
-            .is_some_and(|count| count > 0),
-        "shopify_status must expose index.edge_count: {status_json:#}"
-    );
-}
-
-#[tokio::test]
-async fn full_build_records_missing_raw_markdown_as_skipped_coverage() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = MockTextSource::new(&[
-        (SHOPIFY_LLMS_URL, ""),
-        (
-            SHOPIFY_SITEMAP_URL,
-            r#"
-            <urlset>
-              <url><loc>https://shopify.dev/docs/apps/build/html-only</loc></url>
-            </urlset>
-            "#,
-        ),
-    ]);
-
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let response = status(&paths).unwrap();
-    assert_eq!(response.doc_count, 1);
-    assert_eq!(response.coverage.discovered_count, 1);
-    assert_eq!(response.coverage.skipped_count, 1);
-    assert_eq!(response.coverage.failed_count, 0);
-    assert_eq!(response.coverage.sources.sitemap, 1);
-    assert!(response.coverage.last_sitemap_at.is_some());
-    assert!(
-        response
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("skipped because raw markdown was unavailable"))
-    );
-}
-
-#[tokio::test]
-async fn refresh_without_path_sweeps_only_aging_or_stale_docs() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    fs::create_dir_all(&paths.raw).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    let fresh_source = SourceDoc {
-        url: "https://shopify.dev/docs/apps/build/fresh.md".to_string(),
-        title_hint: Some("Fresh doc".to_string()),
-        content: "# Fresh doc\nCurrent content.\n".to_string(),
-        source: "sitemap".to_string(),
-    };
-    let stale_source = SourceDoc {
-        url: "https://shopify.dev/docs/apps/build/stale.md".to_string(),
-        title_hint: Some("Stale doc".to_string()),
-        content: "# Stale doc\nOld content.\n".to_string(),
-        source: "sitemap".to_string(),
-    };
-    let fresh = store_source_doc(&paths, &fresh_source).unwrap();
-    let stale = store_source_doc(&paths, &stale_source).unwrap();
-    let fresh_sha = fresh.content_sha.clone();
-    upsert_doc(&conn, &fresh).unwrap();
-    upsert_doc(&conn, &stale).unwrap();
-    let old_verified = (Utc::now() - chrono::Duration::days(40)).to_rfc3339();
-    conn.execute(
-        "UPDATE docs SET last_verified = ?1, freshness = 'stale' WHERE path = ?2",
-        params![old_verified, stale.path],
-    )
-    .unwrap();
-    rebuild_tantivy_from_db(&paths).unwrap();
-    let source = MockTextSource::new(&[(
-        "https://shopify.dev/docs/apps/build/stale.md",
-        "# Stale doc\nRefreshed content.\n",
-    )]);
-
-    refresh_stale_docs_from_source(&paths, &source)
-        .await
-        .unwrap();
-
-    let fresh_after = get_doc(&conn, "/docs/apps/build/fresh").unwrap().unwrap();
-    let stale_after = get_doc(&conn, "/docs/apps/build/stale").unwrap().unwrap();
-    assert_eq!(fresh_after.content_sha, fresh_sha);
-    assert_ne!(stale_after.content_sha, stale.content_sha);
-    assert!(get_meta(&conn, "last_aging_sweep_at").unwrap().is_some());
-}
-
-#[tokio::test]
-async fn map_response_exposes_fts_contract_for_zero_results() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = fixture_sources();
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "no-local-doc-should-match-this".to_string(),
-            radius: None,
-            lens: None,
-            version: None,
-            max_nodes: Some(5),
-        },
-    )
-    .unwrap();
-
-    assert!(!response.meta.graph_available);
-    assert_eq!(response.meta.query_interpretation.resolved_as, "free_text");
-    assert_eq!(response.meta.query_interpretation.confidence, "low");
-    assert!(response.meta.query_interpretation.entry_points.is_empty());
-    assert!(response.nodes.is_empty());
-    assert!(response.edges.is_empty());
-    assert_eq!(response.query_plan[0].action, "inspect_status");
-    assert_eq!(response.query_plan[1].action, "refresh");
-}
-
-#[tokio::test]
-async fn map_product_returns_graph_backed_concept_map() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = admin_graphql_graph_sources();
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "Product".to_string(),
-            radius: Some(2),
-            lens: Some("concept".to_string()),
-            version: Some("2026-04".to_string()),
-            max_nodes: Some(20),
-        },
-    )
-    .unwrap();
-
-    assert!(
-        response.meta.graph_available,
-        "v0.2.0 Product map must be graph-backed"
-    );
-    assert_eq!(
-        response.meta.query_interpretation.resolved_as,
-        "concept_name"
-    );
-    assert_eq!(response.center.kind, "concept");
-    assert!(
-        response.center.id.contains("Product"),
-        "center should be the Product concept, got {:?}",
-        response.center.id
-    );
-    assert!(
-        !response.edges.is_empty(),
-        "Product concept map should include graph edges"
-    );
-    assert!(
-        response
-            .suggested_reading_order
-            .iter()
-            .any(|path| path == "/docs/api/admin-graphql/2026-04/objects/Product"),
-        "reading order must include the Product reference doc: {:?}",
-        response.suggested_reading_order
-    );
-}
-
-#[tokio::test]
-async fn map_doc_path_reaches_product_concept() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = admin_graphql_graph_sources();
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "/docs/api/admin-graphql/2026-04/objects/Product".to_string(),
-            radius: Some(2),
-            lens: Some("doc".to_string()),
-            version: Some("2026-04".to_string()),
-            max_nodes: Some(20),
-        },
-    )
-    .unwrap();
-
-    assert!(
-        response.meta.graph_available,
-        "doc path maps should use the graph when Admin GraphQL concepts are indexed"
-    );
-    assert_eq!(response.meta.query_interpretation.resolved_as, "doc_path");
-    assert_eq!(response.center.kind, "doc");
-    let product_concept = response
-        .nodes
-        .iter()
-        .find(|node| node.kind == "concept" && node.id.contains("Product"))
-        .expect("Product reference doc should reach the Product concept");
-    let product_doc_path = "/docs/api/admin-graphql/2026-04/objects/Product";
-    assert!(response.edges.iter().any(|edge| {
-        let from = edge.get("from").and_then(Value::as_str);
-        let to = edge.get("to").and_then(Value::as_str);
-        (from == Some(product_doc_path) && to == Some(product_concept.id.as_str()))
-            || (from == Some(product_concept.id.as_str()) && to == Some(product_doc_path))
-    }));
-}
-
-#[tokio::test]
-async fn map_free_text_promotes_docs_to_graph_entry_points() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = admin_graphql_graph_sources();
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "discount function cart level".to_string(),
-            radius: Some(2),
-            lens: Some("auto".to_string()),
-            version: Some("2026-04".to_string()),
-            max_nodes: Some(20),
-        },
-    )
-    .unwrap();
-
-    assert!(
-        response.meta.graph_available,
-        "free text maps should promote FTS docs into graph entry points when possible"
-    );
-    assert_eq!(response.meta.query_interpretation.resolved_as, "free_text");
-    assert!(
-        !response.meta.query_interpretation.entry_points.is_empty(),
-        "free text maps should report the FTS entry points used for graph expansion"
-    );
-    assert!(
-        response
-            .nodes
-            .iter()
-            .any(|node| node.path == "/docs/apps/build/discounts/cart-level"),
-        "promoted discount cart-level doc should remain in the result"
-    );
-    assert!(
-        response
-            .nodes
-            .iter()
-            .any(|node| node.path == "/docs/apps/build/discounts/overview"),
-        "unpromoted FTS docs should not be dropped from the result"
-    );
-    assert!(
-        !response.edges.is_empty(),
-        "promoted free text maps should include graph edges"
-    );
-}
-
-#[tokio::test]
-async fn map_without_schema_falls_back_to_fts_with_graph_warning() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = fixture_sources();
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "Admin GraphQL".to_string(),
-            radius: Some(2),
-            lens: Some("auto".to_string()),
-            version: None,
-            max_nodes: Some(5),
-        },
-    )
-    .unwrap();
-
-    assert!(!response.meta.graph_available);
-    assert!(
-        response.meta.coverage_warning.is_some(),
-        "fallback maps should explain that graph coverage or schema data is missing"
-    );
-    assert_eq!(
-        response.query_plan.first().map(|step| step.action.as_str()),
-        Some("inspect_status"),
-        "fallback maps should ask the agent to inspect status before trusting graph coverage"
-    );
-}
-
-#[tokio::test]
-async fn graph_edges_only_reference_returned_nodes() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = admin_graphql_graph_sources();
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
-        .unwrap();
-
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "Product".to_string(),
-            radius: Some(1),
-            lens: Some("concept".to_string()),
-            version: Some("2026-04".to_string()),
-            max_nodes: Some(5),
-        },
-    )
-    .unwrap();
-
-    assert!(
-        !response.edges.is_empty(),
-        "edge closure can only be checked when graph edges are returned"
-    );
-    let returned_ids = response
-        .nodes
-        .iter()
-        .map(|node| node.id.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    for edge in &response.edges {
-        let from = edge
-            .get("from")
-            .and_then(Value::as_str)
-            .expect("edge.from must be a string");
-        let to = edge
-            .get("to")
-            .and_then(Value::as_str)
-            .expect("edge.to must be a string");
-        assert!(
-            returned_ids.contains(from),
-            "edge.from must reference a returned node: {edge:#}"
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].title,
+            "DraftOrderLineItem.grams field removed in 2026-07"
+        );
+        assert_eq!(
+            entries[0].link,
+            "https://shopify.dev/changelog/draft-order-line-item-grams"
         );
         assert!(
-            returned_ids.contains(to),
-            "edge.to must reference a returned node: {edge:#}"
+            entries[0]
+                .categories
+                .contains(&"Admin GraphQL API".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_sitemap_links_for_docs_and_changelog() {
+        let links = parse_sitemap_links(
+            r#"
+            <urlset>
+              <url><loc>https://shopify.dev/docs/apps/build/access-scopes</loc></url>
+              <url><loc>https://shopify.dev/changelog/managed-access-scopes</loc></url>
+              <url><loc>https://shopify.dev/partners</loc></url>
+            </urlset>
+            "#,
+        );
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].source, "sitemap");
+        assert_eq!(
+            links[0].url,
+            "https://shopify.dev/docs/apps/build/access-scopes"
+        );
+        assert_eq!(
+            canonical_doc_path(&links[1].url).unwrap(),
+            "/changelog/managed-access-scopes"
+        );
+    }
+
+    #[test]
+    fn extracts_anchor_section_and_removes_code_blocks() {
+        let markdown = "# Intro\nKeep\n\n## Managed access scopes\nText\n```graphql\nquery { shop { name } }\n```\nMore\n\n## Next\nDone\n";
+        let sections = extract_sections(markdown);
+        let scoped = section_content(markdown, &sections, "managed-access-scopes").unwrap();
+        assert!(scoped.contains("## Managed access scopes"));
+        assert!(!scoped.contains("## Next"));
+
+        let without_code = remove_fenced_code_blocks(&scoped);
+        assert!(without_code.contains("Text"));
+        assert!(!without_code.contains("query { shop"));
+        assert!(without_code.contains("More"));
+    }
+}
+
+mod url_policy {
+    use super::*;
+
+    #[test]
+    fn builds_raw_candidates() {
+        let candidates =
+            raw_doc_candidates("https://shopify.dev/docs/api/admin-graphql/latest").unwrap();
+        assert_eq!(
+            candidates[0],
+            "https://shopify.dev/docs/api/admin-graphql/latest.md"
+        );
+        assert_eq!(
+            candidates[1],
+            "https://shopify.dev/docs/api/admin-graphql/latest.txt"
+        );
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn classifies_admin_graphql_surface() {
+        assert_eq!(
+            classify_api_surface("/docs/api/admin-graphql/latest/objects/Product").as_deref(),
+            Some("admin_graphql")
+        );
+        assert_eq!(
+            classify_content_class("/docs/api/admin-graphql/latest/objects/Product"),
+            "schema_ref"
+        );
+    }
+
+    #[test]
+    fn classifies_root_api_pages() {
+        assert_eq!(
+            classify_api_surface("/docs/api/admin-graphql").as_deref(),
+            Some("admin_graphql")
+        );
+        assert_eq!(
+            classify_api_surface("/docs/api/storefront").as_deref(),
+            Some("storefront")
+        );
+        assert_eq!(classify_content_class("/docs/api/admin-graphql"), "api_ref");
+        assert_eq!(classify_doc_type("/docs/api/storefront"), "reference");
+    }
+
+    #[test]
+    fn canonical_path_strips_raw_suffix() {
+        let path = canonical_doc_path(
+            "https://shopify.dev/docs/api/admin-graphql/latest/queries/product.txt",
+        )
+        .unwrap();
+        assert_eq!(path, "/docs/api/admin-graphql/latest/queries/product");
+    }
+
+    #[test]
+    fn canonical_path_keeps_llms_txt() {
+        let path = canonical_doc_path("https://shopify.dev/llms.txt").unwrap();
+        assert_eq!(path, "/llms.txt");
+    }
+}
+
+mod on_demand_config {
+    use super::*;
+
+    #[test]
+    fn on_demand_config_defaults_to_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+
+        let config = load_config(&paths).unwrap();
+
+        assert!(!config.index.enable_on_demand_fetch);
+    }
+
+    #[test]
+    fn on_demand_policy_normalizes_allowed_urls_and_paths() {
+        let from_url = OnDemandFetchPolicy::candidate_from_input(
+            "https://shopify.dev/docs/apps/build/access-scopes/?utm=1#managed-access-scopes",
+        )
+        .unwrap();
+        assert_eq!(from_url.canonical_path, "/docs/apps/build/access-scopes");
+        assert_eq!(
+            from_url.source_url,
+            "https://shopify.dev/docs/apps/build/access-scopes"
+        );
+
+        let from_path =
+            OnDemandFetchPolicy::candidate_from_input("/changelog/managed-access-scopes/").unwrap();
+        assert_eq!(from_path.canonical_path, "/changelog/managed-access-scopes");
+        assert_eq!(
+            from_path.source_url,
+            "https://shopify.dev/changelog/managed-access-scopes"
+        );
+    }
+
+    #[test]
+    fn on_demand_policy_rejects_outside_scope_without_network_candidate() {
+        assert!(
+            OnDemandFetchPolicy::candidate_from_input(
+                "http://shopify.dev/docs/apps/build/app-home"
+            )
+            .is_err()
+        );
+        assert!(
+            OnDemandFetchPolicy::candidate_from_input(
+                "https://example.com/docs/apps/build/app-home"
+            )
+            .is_err()
+        );
+        assert!(OnDemandFetchPolicy::candidate_from_input("https://shopify.dev/partners").is_err());
+    }
+}
+
+mod on_demand {
+    use super::*;
+
+    #[tokio::test]
+    async fn mcp_fetch_url_disabled_returns_v05_error_contract_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let response = handle_mcp_request(
+            &paths,
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{
+                    "name":"shopify_fetch",
+                    "arguments":{
+                        "url":"https://shopify.dev/docs/apps/build/access-scopes"
+                    }
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(response["error"]["code"], -32007);
+        assert_eq!(
+            response["error"]["data"]["candidate_url"],
+            "https://shopify.dev/docs/apps/build/access-scopes"
+        );
+        assert_eq!(
+            response["error"]["data"]["canonical_path"],
+            "/docs/apps/build/access-scopes"
+        );
+        assert_eq!(response["error"]["data"]["enable_on_demand_fetch"], false);
+    }
+
+    #[tokio::test]
+    async fn mcp_fetch_url_outside_scope_returns_policy_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        write_on_demand_config(&paths, true);
+
+        let response = handle_mcp_request(
+            &paths,
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{
+                    "name":"shopify_fetch",
+                    "arguments":{
+                        "url":"https://shopify.dev/partners"
+                    }
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(response["error"]["code"], -32008);
+        assert!(
+            response["error"]["data"]["allowed_scope"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn on_demand_fetch_url_stores_raw_doc_upserts_and_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        write_on_demand_config(&paths, true);
+        let source = MockTextSource::new(&[(
+            "https://shopify.dev/docs/apps/build/on-demand.md",
+            "# On demand\nRecovered optional access scopes content.\n",
+        )]);
+
+        let response = shopify_fetch_from_source(
+            &paths,
+            &FetchArgs {
+                path: None,
+                url: Some(
+                    "https://shopify.dev/docs/apps/build/on-demand?from=test#top".to_string(),
+                ),
+                anchor: None,
+                include_code_blocks: None,
+                max_chars: None,
+            },
+            &source,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.path, "/docs/apps/build/on-demand");
+        assert!(
+            response
+                .content
+                .contains("Recovered optional access scopes")
+        );
+        let conn = open_db(&paths).unwrap();
+        let stored = get_doc(&conn, "/docs/apps/build/on-demand")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.source, "on_demand");
+        assert!(paths.raw_file(&stored.raw_path).exists());
+        let results = search_docs(&paths, "Recovered optional scopes", None, 5).unwrap();
+        assert_eq!(results[0].path, "/docs/apps/build/on-demand");
+
+        let fetched_by_path = shopify_fetch_from_source(
+            &paths,
+            &FetchArgs {
+                path: Some("/docs/apps/build/on-demand".to_string()),
+                url: None,
+                anchor: None,
+                include_code_blocks: None,
+                max_chars: None,
+            },
+            &source,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched_by_path.path, "/docs/apps/build/on-demand");
+    }
+
+    #[tokio::test]
+    async fn on_demand_fetch_unindexed_path_derives_official_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        write_on_demand_config(&paths, true);
+        let source = MockTextSource::new(&[(
+            "https://shopify.dev/changelog/managed-access-scopes.md",
+            "# Managed access scopes\nChangelog text.\n",
+        )]);
+
+        let response = shopify_fetch_from_source(
+            &paths,
+            &FetchArgs {
+                path: Some("/changelog/managed-access-scopes".to_string()),
+                url: None,
+                anchor: None,
+                include_code_blocks: None,
+                max_chars: None,
+            },
+            &source,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.url,
+            "https://shopify.dev/changelog/managed-access-scopes.md"
+        );
+        assert_eq!(response.path, "/changelog/managed-access-scopes");
+    }
+
+    #[tokio::test]
+    async fn on_demand_refresh_preserves_existing_higher_precedence_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        write_on_demand_config(&paths, true);
+        fs::create_dir_all(&paths.raw).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        let source_doc = SourceDoc {
+            url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
+            title_hint: Some("Access scopes".to_string()),
+            content: "# Access scopes\nIndexed by sitemap.\n".to_string(),
+            source: "sitemap".to_string(),
+        };
+        let record = store_source_doc(&paths, &source_doc).unwrap();
+        upsert_doc(&conn, &record).unwrap();
+        rebuild_tantivy_from_db(&paths).unwrap();
+        let source = MockTextSource::new(&[(
+            "https://shopify.dev/docs/apps/build/access-scopes.md",
+            "# Access scopes\nRefreshed by on-demand fetch.\n",
+        )]);
+
+        refresh_url_from_source(
+            &paths,
+            "https://shopify.dev/docs/apps/build/access-scopes",
+            &source,
+        )
+        .await
+        .unwrap();
+
+        let refreshed = get_doc(&conn, "/docs/apps/build/access-scopes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.source, "sitemap");
+        assert_ne!(refreshed.content_sha, record.content_sha);
+    }
+
+    #[tokio::test]
+    async fn on_demand_refetch_removes_stale_tantivy_terms_for_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        write_on_demand_config(&paths, true);
+        let source = MockTextSource::new(&[(
+            "https://shopify.dev/docs/apps/build/delta.md",
+            "# Delta\nFresh replacement term.\n",
+        )]);
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        let old = store_source_doc(
+            &paths,
+            &SourceDoc {
+                url: "https://shopify.dev/docs/apps/build/delta.md".to_string(),
+                title_hint: Some("Delta".to_string()),
+                content: "# Delta\nObsoleteUniqueTerm.\n".to_string(),
+                source: "on_demand".to_string(),
+            },
+        )
+        .unwrap();
+        upsert_doc(&conn, &old).unwrap();
+        rebuild_tantivy_from_db(&paths).unwrap();
+
+        refresh_url_from_source(&paths, "https://shopify.dev/docs/apps/build/delta", &source)
+            .await
+            .unwrap();
+
+        assert!(
+            search_docs(&paths, "Fresh replacement", None, 5)
+                .unwrap()
+                .iter()
+                .any(|doc| doc.path == "/docs/apps/build/delta")
+        );
+        assert!(
+            search_docs(&paths, "ObsoleteUniqueTerm", None, 5)
+                .unwrap()
+                .is_empty()
         );
     }
 }
 
-#[tokio::test]
-async fn reading_order_contains_only_doc_paths() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = admin_graphql_graph_sources();
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
-        .await
+mod map {
+    use super::*;
+
+    #[tokio::test]
+    async fn map_zero_results_suggests_allowed_on_demand_candidate_without_fetching() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "https://shopify.dev/docs/apps/build/missing".to_string(),
+                radius: None,
+                lens: None,
+                version: None,
+                max_nodes: Some(5),
+            },
+        )
         .unwrap();
 
-    let response = shopify_map(
-        &paths,
-        &MapArgs {
-            from: "Product".to_string(),
-            radius: Some(2),
-            lens: Some("concept".to_string()),
-            version: Some("2026-04".to_string()),
-            max_nodes: Some(20),
-        },
-    )
-    .unwrap();
+        let candidate = response
+            .meta
+            .on_demand_candidate
+            .expect("allowed URL-like zero result should produce candidate metadata");
+        assert_eq!(candidate.url, "https://shopify.dev/docs/apps/build/missing");
+        assert!(!candidate.enabled);
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        assert_eq!(count_docs(&conn).unwrap(), 0);
+    }
 
-    assert!(
-        response.meta.graph_available,
-        "reading order should be checked on a graph-backed map"
-    );
-    assert!(
-        !response.suggested_reading_order.is_empty(),
-        "graph-backed maps should suggest source docs to read"
-    );
-    assert!(
-        response
-            .suggested_reading_order
+    #[tokio::test]
+    async fn map_zero_results_does_not_suggest_disallowed_on_demand_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "https://shopify.dev/partners".to_string(),
+                radius: None,
+                lens: None,
+                version: None,
+                max_nodes: Some(5),
+            },
+        )
+        .unwrap();
+
+        assert!(response.meta.on_demand_candidate.is_none());
+    }
+
+    #[tokio::test]
+    async fn map_nonzero_results_do_not_add_on_demand_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        fs::create_dir_all(&paths.raw).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        let source = SourceDoc {
+            url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
+            title_hint: Some("Access scopes".to_string()),
+            content: "# Access scopes\nLocal indexed text.\n".to_string(),
+            source: "sitemap".to_string(),
+        };
+        let record = store_source_doc(&paths, &source).unwrap();
+        upsert_doc(&conn, &record).unwrap();
+        rebuild_tantivy_from_db(&paths).unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "/docs/apps/build/access-scopes".to_string(),
+                radius: None,
+                lens: None,
+                version: None,
+                max_nodes: Some(5),
+            },
+        )
+        .unwrap();
+
+        assert!(!response.nodes.is_empty());
+        assert!(response.meta.on_demand_candidate.is_none());
+    }
+
+    #[tokio::test]
+    async fn map_doc_node_includes_scheduled_change_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        seed_draft_order_graph(&paths);
+        let feed = changelog_feed(
+            "DraftOrderLineItem.grams field removed in 2026-07",
+            "The DraftOrderLineItem.grams field will be removed. Migrate to weight.",
+            "https://shopify.dev/changelog/draft-order-line-item-grams-map",
+        );
+        let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, &feed)]);
+        poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
+            .await
+            .unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem".to_string(),
+                radius: Some(1),
+                lens: Some("doc".to_string()),
+                version: Some("2026-04".to_string()),
+                max_nodes: Some(10),
+            },
+        )
+        .unwrap();
+
+        let doc_node = response
+            .nodes
             .iter()
-            .all(|path| path.starts_with("/docs/") || path.starts_with("/changelog/")),
-        "suggested_reading_order should contain only doc paths: {:?}",
-        response.suggested_reading_order
-    );
+            .find(|node| node.path == "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem")
+            .expect("map response should include the affected doc node");
+        assert!(doc_node.staleness.references_deprecated);
+        assert!(doc_node.staleness.upcoming_changes.iter().any(|change| {
+            change["type_name"] == "DraftOrderLineItem.grams"
+                && change["change"] == "removal"
+                && change["effective_date"] == "2026-07"
+                && change["migration_hint"]
+                    .as_str()
+                    .is_some_and(|hint| hint.contains("Migrate to weight"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn map_response_exposes_fts_contract_for_zero_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = fixture_sources();
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "no-local-doc-should-match-this".to_string(),
+                radius: None,
+                lens: None,
+                version: None,
+                max_nodes: Some(5),
+            },
+        )
+        .unwrap();
+
+        assert!(!response.meta.graph_available);
+        assert_eq!(response.meta.query_interpretation.resolved_as, "free_text");
+        assert_eq!(response.meta.query_interpretation.confidence, "low");
+        assert!(response.meta.query_interpretation.entry_points.is_empty());
+        assert!(response.nodes.is_empty());
+        assert!(response.edges.is_empty());
+        assert_eq!(response.query_plan[0].action, "inspect_status");
+        assert_eq!(response.query_plan[1].action, "refresh");
+    }
+
+    #[tokio::test]
+    async fn map_product_returns_graph_backed_concept_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = admin_graphql_graph_sources();
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "Product".to_string(),
+                radius: Some(2),
+                lens: Some("concept".to_string()),
+                version: Some("2026-04".to_string()),
+                max_nodes: Some(20),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            response.meta.graph_available,
+            "v0.2.0 Product map must be graph-backed"
+        );
+        assert_eq!(
+            response.meta.query_interpretation.resolved_as,
+            "concept_name"
+        );
+        assert_eq!(response.center.kind, "concept");
+        assert!(
+            response.center.id.contains("Product"),
+            "center should be the Product concept, got {:?}",
+            response.center.id
+        );
+        assert!(
+            !response.edges.is_empty(),
+            "Product concept map should include graph edges"
+        );
+        assert!(
+            response
+                .suggested_reading_order
+                .iter()
+                .any(|path| path == "/docs/api/admin-graphql/2026-04/objects/Product"),
+            "reading order must include the Product reference doc: {:?}",
+            response.suggested_reading_order
+        );
+    }
+
+    #[tokio::test]
+    async fn map_doc_path_reaches_product_concept() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = admin_graphql_graph_sources();
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "/docs/api/admin-graphql/2026-04/objects/Product".to_string(),
+                radius: Some(2),
+                lens: Some("doc".to_string()),
+                version: Some("2026-04".to_string()),
+                max_nodes: Some(20),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            response.meta.graph_available,
+            "doc path maps should use the graph when Admin GraphQL concepts are indexed"
+        );
+        assert_eq!(response.meta.query_interpretation.resolved_as, "doc_path");
+        assert_eq!(response.center.kind, "doc");
+        let product_concept = response
+            .nodes
+            .iter()
+            .find(|node| node.kind == "concept" && node.id.contains("Product"))
+            .expect("Product reference doc should reach the Product concept");
+        let product_doc_path = "/docs/api/admin-graphql/2026-04/objects/Product";
+        assert!(response.edges.iter().any(|edge| {
+            let from = edge.get("from").and_then(Value::as_str);
+            let to = edge.get("to").and_then(Value::as_str);
+            (from == Some(product_doc_path) && to == Some(product_concept.id.as_str()))
+                || (from == Some(product_concept.id.as_str()) && to == Some(product_doc_path))
+        }));
+    }
+
+    #[tokio::test]
+    async fn map_free_text_promotes_docs_to_graph_entry_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = admin_graphql_graph_sources();
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "discount function cart level".to_string(),
+                radius: Some(2),
+                lens: Some("auto".to_string()),
+                version: Some("2026-04".to_string()),
+                max_nodes: Some(20),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            response.meta.graph_available,
+            "free text maps should promote FTS docs into graph entry points when possible"
+        );
+        assert_eq!(response.meta.query_interpretation.resolved_as, "free_text");
+        assert!(
+            !response.meta.query_interpretation.entry_points.is_empty(),
+            "free text maps should report the FTS entry points used for graph expansion"
+        );
+        assert!(
+            response
+                .nodes
+                .iter()
+                .any(|node| node.path == "/docs/apps/build/discounts/cart-level"),
+            "promoted discount cart-level doc should remain in the result"
+        );
+        assert!(
+            response
+                .nodes
+                .iter()
+                .any(|node| node.path == "/docs/apps/build/discounts/overview"),
+            "unpromoted FTS docs should not be dropped from the result"
+        );
+        assert!(
+            !response.edges.is_empty(),
+            "promoted free text maps should include graph edges"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_without_schema_falls_back_to_fts_with_graph_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = fixture_sources();
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "Admin GraphQL".to_string(),
+                radius: Some(2),
+                lens: Some("auto".to_string()),
+                version: None,
+                max_nodes: Some(5),
+            },
+        )
+        .unwrap();
+
+        assert!(!response.meta.graph_available);
+        assert!(
+            response.meta.coverage_warning.is_some(),
+            "fallback maps should explain that graph coverage or schema data is missing"
+        );
+        assert_eq!(
+            response.query_plan.first().map(|step| step.action.as_str()),
+            Some("inspect_status"),
+            "fallback maps should ask the agent to inspect status before trusting graph coverage"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_edges_only_reference_returned_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = admin_graphql_graph_sources();
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "Product".to_string(),
+                radius: Some(1),
+                lens: Some("concept".to_string()),
+                version: Some("2026-04".to_string()),
+                max_nodes: Some(5),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !response.edges.is_empty(),
+            "edge closure can only be checked when graph edges are returned"
+        );
+        let returned_ids = response
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for edge in &response.edges {
+            let from = edge
+                .get("from")
+                .and_then(Value::as_str)
+                .expect("edge.from must be a string");
+            let to = edge
+                .get("to")
+                .and_then(Value::as_str)
+                .expect("edge.to must be a string");
+            assert!(
+                returned_ids.contains(from),
+                "edge.from must reference a returned node: {edge:#}"
+            );
+            assert!(
+                returned_ids.contains(to),
+                "edge.to must reference a returned node: {edge:#}"
+            );
+        }
+    }
 }
 
-#[tokio::test]
-async fn build_persists_and_reuses_graph_snapshot() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    let source = admin_graphql_graph_sources();
-    build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+mod coverage {
+    use super::*;
+
+    #[tokio::test]
+    async fn coverage_repair_retries_failed_allowed_rows_and_skips_policy_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        write_on_demand_config(&paths, true);
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        insert_coverage_event(
+            &conn,
+            &CoverageEvent {
+                source: "sitemap".to_string(),
+                canonical_path: Some("/docs/apps/build/repairable".to_string()),
+                source_url: "https://shopify.dev/docs/apps/build/repairable".to_string(),
+                status: "failed".to_string(),
+                reason: Some("network_error".to_string()),
+                http_status: None,
+                checked_at: "2026-04-17T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        insert_coverage_event(
+            &conn,
+            &CoverageEvent {
+                source: "sitemap".to_string(),
+                canonical_path: None,
+                source_url: "https://shopify.dev/partners".to_string(),
+                status: "failed".to_string(),
+                reason: Some("outside_scope".to_string()),
+                http_status: None,
+                checked_at: "2026-04-17T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        let source = MockTextSource::new(&[(
+            "https://shopify.dev/docs/apps/build/repairable.md",
+            "# Repairable\nRecovered through coverage repair.\n",
+        )]);
+
+        let summary = coverage_repair_from_source(&paths, &source).await.unwrap();
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.repaired, 1);
+        assert_eq!(summary.skipped_policy, 1);
+        assert_eq!(
+            get_doc(&conn, "/docs/apps/build/repairable")
+                .unwrap()
+                .unwrap()
+                .source,
+            "on_demand"
+        );
+        assert_eq!(
+            count_where(
+                &conn,
+                "coverage_reports",
+                "source_url = 'https://shopify.dev/docs/apps/build/repairable' AND status = 'indexed'"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn coverage_repair_disabled_skips_allowed_rows_without_fetching() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        insert_coverage_event(
+            &conn,
+            &CoverageEvent {
+                source: "sitemap".to_string(),
+                canonical_path: Some("/docs/apps/build/disabled-repair".to_string()),
+                source_url: "https://shopify.dev/docs/apps/build/disabled-repair".to_string(),
+                status: "failed".to_string(),
+                reason: Some("network_error".to_string()),
+                http_status: None,
+                checked_at: "2026-04-17T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        let source = MockTextSource::new(&[(
+            "https://shopify.dev/docs/apps/build/disabled-repair.md",
+            "# Should not fetch\n",
+        )]);
+
+        let summary = coverage_repair_from_source(&paths, &source).await.unwrap();
+
+        assert_eq!(summary.attempted, 0);
+        assert_eq!(summary.skipped_disabled, 1);
+        assert!(
+            get_doc(&conn, "/docs/apps/build/disabled-repair")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn coverage_status_counts_report_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        insert_coverage_event(
+            &conn,
+            &CoverageEvent {
+                source: "sitemap".to_string(),
+                canonical_path: Some("/docs/apps/build/access-scopes".to_string()),
+                source_url: "https://shopify.dev/docs/apps/build/access-scopes".to_string(),
+                status: "skipped".to_string(),
+                reason: Some("markdown_not_found".to_string()),
+                http_status: Some(404),
+                checked_at: "2026-04-17T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let coverage = coverage_status(&conn).unwrap();
+        assert_eq!(coverage.discovered_count, 1);
+        assert_eq!(coverage.skipped_count, 1);
+        assert_eq!(coverage.sources.sitemap, 1);
+    }
+}
+
+mod search {
+    use super::*;
+
+    #[test]
+    fn sitemap_sourced_optional_scopes_doc_is_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        fs::create_dir_all(&paths.raw).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        let source = SourceDoc {
+            url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
+            title_hint: Some("Access scopes".to_string()),
+            content: "# Access scopes\nOptional access scopes and managed access scopes let apps request protected permissions.\n".to_string(),
+            source: "sitemap".to_string(),
+        };
+        let record = store_source_doc(&paths, &source).unwrap();
+        upsert_doc(&conn, &record).unwrap();
+        rebuild_tantivy_from_db(&paths).unwrap();
+
+        let results = search_docs(&paths, "optional scopes", None, 5).unwrap();
+        assert_eq!(results[0].path, "/docs/apps/build/access-scopes");
+        assert_eq!(results[0].source, "sitemap");
+    }
+
+    #[tokio::test]
+    async fn search_docs_uses_lindera_for_japanese_queries_without_regressing_english() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = admin_graphql_graph_sources();
+
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let japanese_results = search_docs(&paths, "割引 クーポン", Some("2026-04"), 5).unwrap();
+        assert!(
+            japanese_results
+                .iter()
+                .any(|doc| doc.path == "/docs/apps/build/discounts/cart-level"),
+            "Japanese discount/coupon query should reach the cart-level discount doc: {:?}",
+            japanese_results
+                .iter()
+                .map(|doc| doc.path.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let english_results = search_docs(&paths, "Product", Some("2026-04"), 5).unwrap();
+        assert!(
+            english_results
+                .iter()
+                .any(|doc| doc.path == "/docs/api/admin-graphql/2026-04/objects/Product"),
+            "English type-name search should continue to reach Product docs: {:?}",
+            english_results
+                .iter()
+                .map(|doc| doc.path.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+mod changelog {
+    use super::*;
+
+    #[test]
+    fn init_db_creates_v030_changelog_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+
+        let changelog_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM changelog_entries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let scheduled_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scheduled_changes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(changelog_count, 0);
+        assert_eq!(scheduled_count, 0);
+        assert_eq!(count_where(&conn, "indexed_versions", "1=1").unwrap(), 0);
+        assert_eq!(
+            count_where(&conn, "version_rebuild_queue", "1=1").unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn changelog_resolved_concept_marks_connected_doc_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let conn = seed_draft_order_graph(&paths);
+        let feed = changelog_feed(
+            "DraftOrderLineItem.grams field removed in 2026-07",
+            "The DraftOrderLineItem.grams field will be removed. Migrate to weight.",
+            "https://shopify.dev/changelog/draft-order-line-item-grams",
+        );
+        let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, &feed)]);
+
+        let report = poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
+            .await
+            .unwrap();
+
+        assert_eq!(report.entries_inserted, 1);
+        assert_eq!(report.entries_seen, 1);
+        assert!(report.warnings.is_empty());
+        assert!(report.scheduled_changes > 0);
+        let doc = get_doc(
+            &conn,
+            "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(doc.references_deprecated);
+        assert!(
+            doc.deprecated_refs
+                .iter()
+                .any(|reference| reference == "DraftOrderLineItem.grams")
+        );
+
+        let fetched = shopify_fetch(
+            &paths,
+            &FetchArgs {
+                path: Some(
+                    "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem".to_string(),
+                ),
+                url: None,
+                anchor: None,
+                include_code_blocks: None,
+                max_chars: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(fetched.staleness.references_deprecated);
+        assert!(
+            fetched
+                .staleness
+                .upcoming_changes
+                .iter()
+                .any(|change| change["type_name"] == "DraftOrderLineItem.grams")
+        );
+    }
+
+    #[tokio::test]
+    async fn changelog_unknown_symbol_is_unresolved_and_does_not_mark_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let conn = seed_draft_order_graph(&paths);
+        let feed = changelog_feed(
+            "UnknownType.foo field removed in 2026-07",
+            "The UnknownType.foo field will be removed.",
+            "https://shopify.dev/changelog/unknown-type-field",
+        );
+        let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, &feed)]);
+
+        poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
+            .await
+            .unwrap();
+
+        let unresolved: String = conn
+            .query_row(
+                "SELECT unresolved_affected_refs FROM changelog_entries",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            parse_json_string_vec(Some(&unresolved))
+                .iter()
+                .any(|reference| reference == "UnknownType.foo")
+        );
+        assert_eq!(count_where(&conn, "scheduled_changes", "1=1").unwrap(), 0);
+        let doc = get_doc(
+            &conn,
+            "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!doc.references_deprecated);
+    }
+
+    #[tokio::test]
+    async fn changelog_doc_link_resolves_through_docs_and_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let conn = seed_draft_order_graph(&paths);
+        let feed = changelog_feed(
+            "Draft order docs updated for a removal in 2026-07",
+            "See https://shopify.dev/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem for the removal.",
+            "https://shopify.dev/changelog/draft-order-doc-removal",
+        );
+        let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, &feed)]);
+
+        poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
+            .await
+            .unwrap();
+
+        let affected: String = conn
+            .query_row("SELECT affected_types FROM changelog_entries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let affected = parse_json_string_vec(Some(&affected));
+        assert!(affected.iter().any(|reference| {
+            reference == "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem"
+        }));
+        assert!(
+            affected
+                .iter()
+                .any(|reference| reference == "DraftOrderLineItem.grams")
+        );
+        let doc = get_doc(
+            &conn,
+            "/docs/api/admin-graphql/2026-04/objects/DraftOrderLineItem",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(doc.references_deprecated);
+    }
+}
+
+mod status {
+    use super::*;
+
+    #[tokio::test]
+    async fn status_reports_freshness_workers_and_changelog_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let _conn = seed_draft_order_graph(&paths);
+        let feed = changelog_feed(
+            "DraftOrderLineItem.grams field removed in 2026-07",
+            "The DraftOrderLineItem.grams field will be removed.",
+            "https://shopify.dev/changelog/draft-order-status",
+        );
+        let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, &feed)]);
+
+        poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
+            .await
+            .unwrap();
+        refresh_stale_docs_from_source(&paths, &source)
+            .await
+            .unwrap();
+        let status = status(&paths).unwrap();
+
+        assert_eq!(status.changelog.entry_count, 1);
+        assert!(status.changelog.scheduled_change_count > 0);
+        assert!(status.workers.last_changelog_at.is_some());
+        assert!(status.workers.last_aging_sweep_at.is_some());
+        assert_eq!(status.freshness.fresh_count, 1);
+    }
+
+    #[tokio::test]
+    async fn status_reports_changelog_polling_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = MockTextSource::new(&[(SHOPIFY_CHANGELOG_FEED_URL, "not an rss feed")]);
+
+        let report = poll_changelog_from_source(&paths, SHOPIFY_CHANGELOG_FEED_URL, &source)
+            .await
+            .unwrap();
+
+        assert_eq!(report.entries_inserted, 0);
+        assert_eq!(report.warnings.len(), 1);
+        let status = status(&paths).unwrap();
+        assert!(status.changelog.last_warning.is_some());
+        assert!(
+            status
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Changelog polling warning"))
+        );
+    }
+}
+
+mod version_watcher {
+    use super::*;
+
+    #[tokio::test]
+    async fn version_watcher_enqueues_validated_unindexed_latest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        let source = MockTextSource::new(&[
+            (
+                SHOPIFY_VERSIONING_URL,
+                "Stable version Release date Supported until 2026-04 April 1 2026 2026-07 July 1 2026",
+            ),
+            (
+                &admin_graphql_direct_proxy_url("2026-07"),
+                minimal_introspection(),
+            ),
+        ]);
+
+        let report = check_new_versions_from_source(&paths, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        assert_eq!(report.latest_candidate.as_deref(), Some("2026-07"));
+        assert!(report.enqueued);
+        assert!(get_meta(&conn, "last_version_check_at").unwrap().is_some());
+        assert_eq!(
+            count_where(
+                &conn,
+                "version_rebuild_queue",
+                "version = '2026-07' AND api_surface = 'admin_graphql' AND status = 'pending'"
+            )
+            .unwrap(),
+            1
+        );
+        let status = status(&paths).unwrap();
+        assert!(
+            status
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("version rebuild request"))
+        );
+    }
+
+    #[tokio::test]
+    async fn version_watcher_does_not_enqueue_already_indexed_latest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        fs::create_dir_all(&paths.raw).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        let source_doc = SourceDoc {
+            url: "https://shopify.dev/docs/api/admin-graphql/2026-07/objects/Product.md"
+                .to_string(),
+            title_hint: Some("Product".to_string()),
+            content: "# Product\nCurrent product reference.\n".to_string(),
+            source: "sitemap".to_string(),
+        };
+        let record = store_source_doc(&paths, &source_doc).unwrap();
+        upsert_doc(&conn, &record).unwrap();
+        refresh_indexed_versions(&conn, &[record]).unwrap();
+        let source = MockTextSource::new(&[(
+            SHOPIFY_VERSIONING_URL,
+            "Stable version Release date Supported until 2026-04 April 1 2026 2026-07 July 1 2026",
+        )]);
+
+        let report = check_new_versions_from_source(&paths, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        assert_eq!(report.latest_candidate.as_deref(), Some("2026-07"));
+        assert!(report.already_indexed);
+        assert!(!report.enqueued);
+        assert_eq!(
+            count_where(&conn, "version_rebuild_queue", "1=1").unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn version_watcher_rejects_html_only_candidate_without_schema_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        let source = MockTextSource::new(&[(
+            SHOPIFY_VERSIONING_URL,
+            "Stable version Release date Supported until 2026-10 October 1 2026",
+        )]);
+
+        let report = check_new_versions_from_source(&paths, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        assert_eq!(report.latest_candidate, None);
+        assert!(!report.enqueued);
+        assert!(report.warning.is_some());
+        assert_eq!(
+            count_where(&conn, "version_rebuild_queue", "1=1").unwrap(),
+            0
+        );
+    }
+}
+
+mod mcp {
+    use super::*;
+
+    #[test]
+    fn reads_newline_delimited_mcp_message() {
+        let input = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    "#;
+        let mut reader = std::io::BufReader::new(&input[..]);
+        let message = read_mcp_message(&mut reader).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&message).unwrap();
+        assert_eq!(value["method"], "tools/list");
+    }
+
+    #[test]
+    fn writes_newline_delimited_mcp_message() {
+        let mut output = Vec::new();
+        write_mcp_message(
+            &mut output,
+            &serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}),
+        )
+        .unwrap();
+        assert!(output.ends_with(b"\n"));
+        assert!(!output.starts_with(b"Content-Length:"));
+    }
+
+    #[tokio::test]
+    async fn mcp_initialize_tools_status_sequence_is_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let started = std::time::Instant::now();
+        let initialize = handle_mcp_request(
+            &paths,
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(elapsed.as_millis() < 20);
+        assert_eq!(
+            initialize["result"]["serverInfo"]["name"],
+            "shopify-rextant"
+        );
+
+        let tools = handle_mcp_request(
+            &paths,
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        )
+        .await;
+        assert_eq!(tools["result"]["tools"][0]["name"], "shopify_map");
+
+        let status = handle_mcp_request(
+            &paths,
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":3,
+                "method":"tools/call",
+                "params":{"name":"shopify_status","arguments":{}}
+            }),
+        )
+        .await;
+        assert_eq!(
+            status["result"]["structuredContent"]["schema_version"],
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn reads_content_length_framed_mcp_message() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let mut input = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        input.extend_from_slice(body);
+        let mut reader = std::io::BufReader::new(&input[..]);
+
+        let message = read_mcp_message(&mut reader).unwrap().unwrap();
+        assert_eq!(message, body);
+        let value: serde_json::Value = serde_json::from_slice(&message).unwrap();
+        assert_eq!(value["method"], "initialize");
+    }
+}
+
+mod build {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_build_uses_llms_and_sitemap_union_from_mock_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = fixture_sources();
+
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let conn = open_db(&paths).unwrap();
+        assert_eq!(count_docs(&conn).unwrap(), 3);
+        let admin_root = get_doc(&conn, "/docs/api/admin-graphql").unwrap().unwrap();
+        assert_eq!(admin_root.source, "llms");
+        let access_scopes = get_doc(&conn, "/docs/apps/build/access-scopes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(access_scopes.source, "sitemap");
+
+        let coverage = coverage_status(&conn).unwrap();
+        assert_eq!(coverage.discovered_count, 2);
+        assert_eq!(coverage.indexed_count, 2);
+        assert_eq!(coverage.sources.llms, 1);
+        assert_eq!(coverage.sources.sitemap, 1);
+
+        let results = search_docs(&paths, "optional scopes", None, 5).unwrap();
+        assert_eq!(results[0].path, "/docs/apps/build/access-scopes");
+    }
+
+    #[tokio::test]
+    async fn build_recreates_legacy_tantivy_index_when_search_schema_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        fs::create_dir_all(&paths.tantivy).unwrap();
+        let mut legacy_builder = Schema::builder();
+        legacy_builder.add_text_field("path", STRING | STORED);
+        legacy_builder.add_text_field("title", TEXT | STORED);
+        legacy_builder.add_text_field("url", STRING | STORED);
+        legacy_builder.add_text_field("version", STRING | STORED);
+        legacy_builder.add_text_field("api_surface", STRING | STORED);
+        legacy_builder.add_text_field("doc_type", STRING | STORED);
+        legacy_builder.add_text_field("content", TEXT);
+        let legacy_index = Index::create_in_dir(&paths.tantivy, legacy_builder.build()).unwrap();
+        legacy_index
+            .writer::<TantivyDocument>(50_000_000)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert!(
+            SearchFields::from_schema(&legacy_index.schema()).is_err(),
+            "legacy index fixture should not contain v0.4 content_en/content_ja fields"
+        );
+
+        let source = admin_graphql_graph_sources();
+        build_index_from_sources(&paths, false, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let index = Index::open_in_dir(&paths.tantivy).unwrap();
+        assert!(
+            SearchFields::from_schema(&index.schema()).is_ok(),
+            "build should recreate old Tantivy indexes with the current search schema"
+        );
+        let japanese_results = search_docs(&paths, "割引 クーポン", Some("2026-04"), 5).unwrap();
+        assert!(
+            japanese_results
+                .iter()
+                .any(|doc| doc.path == "/docs/apps/build/discounts/cart-level"),
+            "recreated index should support Japanese search"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_build_indexes_admin_graphql_concepts_edges_and_status_graph_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = admin_graphql_graph_sources();
+
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let schema_snapshot = paths
+            .data
+            .join("schemas/admin-graphql/2026-04.introspection.json");
+        assert!(
+            schema_snapshot.exists(),
+            "v0.2.0 build must persist the Admin GraphQL introspection snapshot at {}",
+            schema_snapshot.display()
+        );
+
+        let conn = open_db(&paths).unwrap();
+        let concept_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM concepts", [], |row| row.get(0))
+            .unwrap();
+        let edge_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            concept_count >= 3,
+            "expected Product, ProductVariant, and ProductInput concepts, got {concept_count}"
+        );
+        assert!(
+            edge_count >= 3,
+            "expected defined_in/has_field/returns edges, got {edge_count}"
+        );
+
+        let status_json = to_json_value(status(&paths).unwrap());
+        assert!(
+            status_json
+                .pointer("/index/concept_count")
+                .and_then(Value::as_i64)
+                .is_some_and(|count| count > 0),
+            "shopify_status must expose index.concept_count: {status_json:#}"
+        );
+        assert!(
+            status_json
+                .pointer("/index/edge_count")
+                .and_then(Value::as_i64)
+                .is_some_and(|count| count > 0),
+            "shopify_status must expose index.edge_count: {status_json:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_build_records_missing_raw_markdown_as_skipped_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = MockTextSource::new(&[
+            (SHOPIFY_LLMS_URL, ""),
+            (
+                SHOPIFY_SITEMAP_URL,
+                r#"
+                <urlset>
+                  <url><loc>https://shopify.dev/docs/apps/build/html-only</loc></url>
+                </urlset>
+                "#,
+            ),
+        ]);
+
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let response = status(&paths).unwrap();
+        assert_eq!(response.doc_count, 1);
+        assert_eq!(response.coverage.discovered_count, 1);
+        assert_eq!(response.coverage.skipped_count, 1);
+        assert_eq!(response.coverage.failed_count, 0);
+        assert_eq!(response.coverage.sources.sitemap, 1);
+        assert!(response.coverage.last_sitemap_at.is_some());
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skipped because raw markdown was unavailable"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_order_contains_only_doc_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = admin_graphql_graph_sources();
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let response = shopify_map(
+            &paths,
+            &MapArgs {
+                from: "Product".to_string(),
+                radius: Some(2),
+                lens: Some("concept".to_string()),
+                version: Some("2026-04".to_string()),
+                max_nodes: Some(20),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            response.meta.graph_available,
+            "reading order should be checked on a graph-backed map"
+        );
+        assert!(
+            !response.suggested_reading_order.is_empty(),
+            "graph-backed maps should suggest source docs to read"
+        );
+        assert!(
+            response
+                .suggested_reading_order
+                .iter()
+                .all(|path| path.starts_with("/docs/") || path.starts_with("/changelog/")),
+            "suggested_reading_order should contain only doc paths: {:?}",
+            response.suggested_reading_order
+        );
+    }
+
+    #[tokio::test]
+    async fn build_persists_and_reuses_graph_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let source = admin_graphql_graph_sources();
+        build_index_from_sources(&paths, true, None, &IndexSourceUrls::default(), &source)
+            .await
+            .unwrap();
+
+        let graph_snapshot = paths.data.join("graph.msgpack");
+        assert!(
+            graph_snapshot.exists(),
+            "graph-backed builds must persist {}",
+            graph_snapshot.display()
+        );
+
+        let started = std::time::Instant::now();
+        let initialize = handle_mcp_request(
+            &paths,
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        )
+        .await;
+        let tools = handle_mcp_request(
+            &paths,
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        )
+        .await;
+        let status = handle_mcp_request(
+            &paths,
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":3,
+                "method":"tools/call",
+                "params":{"name":"shopify_status","arguments":{}}
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            initialize["result"]["serverInfo"]["name"],
+            "shopify-rextant"
+        );
+        assert_eq!(tools["result"]["tools"][0]["name"], "shopify_map");
+        assert!(
+            status["result"]["structuredContent"]
+                .pointer("/index/edge_count")
+                .and_then(Value::as_i64)
+                .is_some_and(|count| count > 0),
+            "status should expose graph counts after loading the graph snapshot: {status:#}"
+        );
+        assert!(
+            elapsed.as_millis() < 20,
+            "MCP initialize/tools/status should stay fast with graph snapshot present; took {elapsed:?}"
+        );
+    }
+}
+
+mod refresh {
+    use super::*;
+
+    #[tokio::test]
+    async fn refresh_without_path_sweeps_only_aging_or_stale_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        fs::create_dir_all(&paths.raw).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        let fresh_source = SourceDoc {
+            url: "https://shopify.dev/docs/apps/build/fresh.md".to_string(),
+            title_hint: Some("Fresh doc".to_string()),
+            content: "# Fresh doc\nCurrent content.\n".to_string(),
+            source: "sitemap".to_string(),
+        };
+        let stale_source = SourceDoc {
+            url: "https://shopify.dev/docs/apps/build/stale.md".to_string(),
+            title_hint: Some("Stale doc".to_string()),
+            content: "# Stale doc\nOld content.\n".to_string(),
+            source: "sitemap".to_string(),
+        };
+        let fresh = store_source_doc(&paths, &fresh_source).unwrap();
+        let stale = store_source_doc(&paths, &stale_source).unwrap();
+        let fresh_sha = fresh.content_sha.clone();
+        upsert_doc(&conn, &fresh).unwrap();
+        upsert_doc(&conn, &stale).unwrap();
+        let old_verified = (Utc::now() - chrono::Duration::days(40)).to_rfc3339();
+        conn.execute(
+            "UPDATE docs SET last_verified = ?1, freshness = 'stale' WHERE path = ?2",
+            params![old_verified, stale.path],
+        )
+        .unwrap();
+        rebuild_tantivy_from_db(&paths).unwrap();
+        let source = MockTextSource::new(&[(
+            "https://shopify.dev/docs/apps/build/stale.md",
+            "# Stale doc\nRefreshed content.\n",
+        )]);
+
+        refresh_stale_docs_from_source(&paths, &source)
+            .await
+            .unwrap();
+
+        let fresh_after = get_doc(&conn, "/docs/apps/build/fresh").unwrap().unwrap();
+        let stale_after = get_doc(&conn, "/docs/apps/build/stale").unwrap().unwrap();
+        assert_eq!(fresh_after.content_sha, fresh_sha);
+        assert_ne!(stale_after.content_sha, stale.content_sha);
+        assert!(get_meta(&conn, "last_aging_sweep_at").unwrap().is_some());
+    }
+}
+
+mod fetch {
+    use super::*;
+
+    #[tokio::test]
+    async fn fetch_response_applies_anchor_code_filter_and_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        fs::create_dir_all(&paths.raw).unwrap();
+        let conn = open_db(&paths).unwrap();
+        init_db(&conn, SCHEMA_VERSION).unwrap();
+        let source = SourceDoc {
+            url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
+            title_hint: Some("Access scopes".to_string()),
+            content: "# Access scopes\nIntro\n\n## Managed access scopes\nText before code.\n```graphql\nquery { shop { name } }\n```\nMore text after code that keeps this section long enough to truncate.\n\n## Next\nDone\n".to_string(),
+            source: "sitemap".to_string(),
+        };
+        let record = store_source_doc(&paths, &source).unwrap();
+        upsert_doc(&conn, &record).unwrap();
+
+        let response = shopify_fetch(
+            &paths,
+            &FetchArgs {
+                path: Some("/docs/apps/build/access-scopes".to_string()),
+                url: None,
+                anchor: Some("managed-access-scopes".to_string()),
+                include_code_blocks: Some(false),
+                max_chars: Some(80),
+            },
+        )
         .await
         .unwrap();
 
-    let graph_snapshot = paths.data.join("graph.msgpack");
-    assert!(
-        graph_snapshot.exists(),
-        "graph-backed builds must persist {}",
-        graph_snapshot.display()
-    );
-
-    let started = std::time::Instant::now();
-    let initialize = handle_mcp_request(
-        &paths,
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
-    )
-    .await;
-    let tools = handle_mcp_request(
-        &paths,
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-    )
-    .await;
-    let status = handle_mcp_request(
-        &paths,
-        serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{"name":"shopify_status","arguments":{}}
-        }),
-    )
-    .await;
-    let elapsed = started.elapsed();
-
-    assert_eq!(
-        initialize["result"]["serverInfo"]["name"],
-        "shopify-rextant"
-    );
-    assert_eq!(tools["result"]["tools"][0]["name"], "shopify_map");
-    assert!(
-        status["result"]["structuredContent"]
-            .pointer("/index/edge_count")
-            .and_then(Value::as_i64)
-            .is_some_and(|count| count > 0),
-        "status should expose graph counts after loading the graph snapshot: {status:#}"
-    );
-    assert!(
-        elapsed.as_millis() < 20,
-        "MCP initialize/tools/status should stay fast with graph snapshot present; took {elapsed:?}"
-    );
-}
-
-#[tokio::test]
-async fn fetch_response_applies_anchor_code_filter_and_truncation() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-    fs::create_dir_all(&paths.raw).unwrap();
-    let conn = open_db(&paths).unwrap();
-    init_db(&conn, SCHEMA_VERSION).unwrap();
-    let source = SourceDoc {
-        url: "https://shopify.dev/docs/apps/build/access-scopes.md".to_string(),
-        title_hint: Some("Access scopes".to_string()),
-        content: "# Access scopes\nIntro\n\n## Managed access scopes\nText before code.\n```graphql\nquery { shop { name } }\n```\nMore text after code that keeps this section long enough to truncate.\n\n## Next\nDone\n".to_string(),
-        source: "sitemap".to_string(),
-    };
-    let record = store_source_doc(&paths, &source).unwrap();
-    upsert_doc(&conn, &record).unwrap();
-
-    let response = shopify_fetch(
-        &paths,
-        &FetchArgs {
-            path: Some("/docs/apps/build/access-scopes".to_string()),
-            url: None,
-            anchor: Some("managed-access-scopes".to_string()),
-            include_code_blocks: Some(false),
-            max_chars: Some(80),
-        },
-    )
-    .await
-    .unwrap();
-
-    assert!(response.sections.iter().any(|section| {
-        section.anchor == "managed-access-scopes" && section.title == "Managed access scopes"
-    }));
-    assert!(response.content.contains("## Managed access scopes"));
-    assert!(response.content.contains("Text before code."));
-    assert!(!response.content.contains("query { shop"));
-    assert!(!response.content.contains("## Next"));
-    assert!(response.truncated);
-    assert!(response.content.chars().count() <= 80);
-}
-
-#[test]
-fn reads_content_length_framed_mcp_message() {
-    let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
-    let mut input = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-    input.extend_from_slice(body);
-    let mut reader = std::io::BufReader::new(&input[..]);
-
-    let message = read_mcp_message(&mut reader).unwrap().unwrap();
-    assert_eq!(message, body);
-    let value: serde_json::Value = serde_json::from_slice(&message).unwrap();
-    assert_eq!(value["method"], "initialize");
+        assert!(response.sections.iter().any(|section| {
+            section.anchor == "managed-access-scopes" && section.title == "Managed access scopes"
+        }));
+        assert!(response.content.contains("## Managed access scopes"));
+        assert!(response.content.contains("Text before code."));
+        assert!(!response.content.contains("query { shop"));
+        assert!(!response.content.contains("## Next"));
+        assert!(response.truncated);
+        assert!(response.content.chars().count() <= 80);
+    }
 }
