@@ -1,7 +1,7 @@
-use super::source::SourceFetchError;
 use super::super::markdown::MarkdownLink;
 use super::super::url_policy::canonical_doc_path;
 use super::super::util::time::now_iso;
+use super::source::SourceFetchError;
 
 #[derive(Debug)]
 pub(crate) struct CoverageEvent {

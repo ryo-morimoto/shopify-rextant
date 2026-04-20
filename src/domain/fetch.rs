@@ -1,7 +1,7 @@
 use serde::Serialize;
 
-use super::map::Staleness;
 use super::super::markdown::SectionInfo;
+use super::map::Staleness;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct FetchResponse {

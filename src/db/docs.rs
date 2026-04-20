@@ -105,10 +105,7 @@ pub(crate) fn count_where(conn: &Connection, table: &str, where_clause: &str) ->
         .map_err(Into::into)
 }
 
-pub(crate) fn stale_refresh_candidates(
-    conn: &Connection,
-    limit: usize,
-) -> Result<Vec<DocRecord>> {
+pub(crate) fn stale_refresh_candidates(conn: &Connection, limit: usize) -> Result<Vec<DocRecord>> {
     let mut stmt = conn.prepare(
         "SELECT path, title, url, version, doc_type, api_surface, content_class, content_sha,
                 last_verified, last_changed, freshness, references_deprecated, deprecated_refs,

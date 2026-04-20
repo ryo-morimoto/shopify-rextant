@@ -2,6 +2,7 @@ use std::fs;
 
 use anyhow::{Result, anyhow};
 
+use super::Paths;
 use super::domain::docs::DocRecord;
 use super::domain::source::{SourceDoc, SourceFetchError};
 use super::markdown::{MarkdownLink, title_from_markdown};
@@ -12,7 +13,6 @@ use super::url_policy::{
 };
 use super::util::hash::hex_sha256;
 use super::util::time::now_iso;
-use super::Paths;
 
 pub(crate) async fn fetch_source_doc<S: TextSource>(
     source: &S,

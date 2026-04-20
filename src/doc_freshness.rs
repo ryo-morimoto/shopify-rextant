@@ -49,10 +49,7 @@ pub(crate) fn scheduled_changes_for_concept(
     scheduled_changes_for_refs(conn, &refs)
 }
 
-pub(crate) fn scheduled_changes_for_refs(
-    conn: &Connection,
-    refs: &[String],
-) -> Result<Vec<Value>> {
+pub(crate) fn scheduled_changes_for_refs(conn: &Connection, refs: &[String]) -> Result<Vec<Value>> {
     if refs.is_empty() {
         return Ok(Vec::new());
     }
