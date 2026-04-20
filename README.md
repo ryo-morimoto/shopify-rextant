@@ -1,150 +1,77 @@
 # shopify-rextant
 
 `shopify-rextant` is a local-first MCP server for Shopify developer documentation.
-It builds a local index of Shopify docs, then gives coding agents source-backed maps
-and raw document fetches without repeated remote `shopify.dev` lookups.
+It builds a local index of Shopify docs, then serves coding agents source-backed
+maps and raw markdown without repeat remote `shopify.dev` lookups.
 
-The server does not synthesize answers, call an LLM, validate user code, or mutate a
-Shopify store. It returns source-backed document and concept context so the caller can
-decide what to read next.
+The server does not synthesize answers, call an LLM, validate user code, or mutate
+any Shopify store. It returns source-backed context; the caller decides what to
+read next.
 
-## Current Status
-
-This repository is at the v0.5.0 implementation stage. The public distribution path is
-still being prepared, so source checkout installation is the canonical path until the
-release workflow and package channels are in place.
-
-Implemented release-candidate capabilities:
-
-- MCP stdio server with newline-delimited JSON and Content-Length framing support
-- `shopify_map`, `shopify_fetch`, and `shopify_status` MCP tools
-- `llms.txt` plus `sitemap.xml` discovery and coverage reporting
-- Admin GraphQL concept/doc graph foundation from Shopify's public direct proxy
-- Changelog freshness and scheduled-change hydration
-- Japanese search tokenization through Lindera/IPADIC
-- On-demand official docs recovery for `shopify.dev/docs/**` and `shopify.dev/changelog/**`
-
-Still pending for public release:
-
-- GitHub release workflow and checksums
-- Homebrew and Nix install paths
-- Final public install docs
-- Security, E2E, and performance-threshold release gates
-
-## Install From Source
+## Quickstart
 
 ```bash
-cargo install --path .
+cargo install --path .        # source install
+shopify-rextant build         # first-time index build (2–5 minutes)
+shopify-rextant status        # confirm doc_count > 0
 ```
 
-Or build a local release binary:
+Register with an MCP client:
 
 ```bash
-cargo build --release
-./target/release/shopify-rextant version
-```
-
-After public packaging is prepared, the intended crates.io command is:
-
-```bash
-cargo install shopify-rextant
-```
-
-## Build The Local Index
-
-```bash
-shopify-rextant build
-```
-
-Use a separate home directory for experiments:
-
-```bash
-SHOPIFY_REXTANT_HOME=/tmp/shopify-rextant-e2e shopify-rextant build --limit 20
-```
-
-## Register With MCP Clients
-
-Claude Code:
-
-```bash
+# Claude Code
 claude mcp add --transport stdio shopify-rextant -- shopify-rextant serve
 ```
 
-Codex CLI config:
-
 ```toml
+# Codex CLI (~/.codex/config.toml)
 [mcp_servers.shopify-rextant]
 command = "shopify-rextant"
 args = ["serve"]
 ```
 
-For transport debugging, bypass the shared daemon shim:
+## Documentation
 
-```bash
-shopify-rextant serve --direct
-```
+- User guide: [`docs/user/install.md`](docs/user/install.md), [`cli.md`](docs/user/cli.md), [`mcp.md`](docs/user/mcp.md), [`config.md`](docs/user/config.md), [`troubleshooting.md`](docs/user/troubleshooting.md)
+- Developer guide: [`docs/dev/architecture.md`](docs/dev/architecture.md), [`testing.md`](docs/dev/testing.md), [`release.md`](docs/dev/release.md)
 
-## CLI Usage
+## Capabilities
 
-```bash
-shopify-rextant status
-shopify-rextant search "Product" --version 2026-04 --limit 5
-shopify-rextant show /docs/api/admin-graphql/2026-04/objects/Product
-shopify-rextant show /docs/apps/build/access-scopes --anchor managed-access-scopes
-shopify-rextant refresh
-shopify-rextant coverage repair
-```
-
-## On-Demand Fetch
-
-On-demand network recovery is disabled by default. Enable it explicitly in
-`~/.shopify-rextant/config.toml`:
-
-```toml
-[index]
-enable_on_demand_fetch = true
-```
-
-Then recover a known official Shopify docs URL:
-
-```bash
-shopify-rextant refresh --url https://shopify.dev/docs/apps/build/access-scopes
-```
-
-Allowed scopes are only:
-
-- `https://shopify.dev/docs/**`
-- `https://shopify.dev/changelog/**`
-
-Other hosts, schemes, and Shopify paths are rejected before any network request.
+- MCP stdio server (newline-delimited JSON, also accepts `Content-Length` framing)
+- `shopify_map`, `shopify_fetch`, and `shopify_status` tools
+- `llms.txt` + `sitemap.xml` discovery with coverage reporting
+- Admin GraphQL concept/doc graph from Shopify's public direct proxy
+- Changelog freshness and scheduled-change hydration
+- Japanese search tokenization via Lindera / IPADIC
+- Opt-in on-demand recovery of missing `shopify.dev/docs/**` and `shopify.dev/changelog/**` pages
 
 ## Privacy Boundary
 
-External requests are limited to official Shopify documentation endpoints used for
-indexing and refresh. `shopify-rextant` does not send user code, user prompts,
-private project files, MCP client metadata, or telemetry.
+Outbound HTTP is limited to official Shopify documentation endpoints used for
+indexing and refresh. The server never sends user code, prompts, project files,
+MCP client metadata, or telemetry.
 
-## Validation
+## Install From Source
 
-Before releasing or opening a PR, run:
-
-```bash
-cargo fmt --check
-cargo test
-cargo bench --bench release_contract -- --test
-cargo package --list
-cargo package
-```
-
-When changing MCP transport, also run a direct newline-delimited JSON smoke test:
+See [`docs/user/install.md`](docs/user/install.md) for the full instructions.
 
 ```bash
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
-  | target/debug/shopify-rextant serve --direct
+cargo install --path .
+# or
+cargo build --release
+./target/release/shopify-rextant version
 ```
 
-## Design
+## Distribution Channels (v1.0 target)
 
-The implementation contract and roadmap live in `SPEC.md`. The key product boundary is:
-local-first source retrieval, zero telemetry, no LLM synthesis, and no live Shopify store
-mutation.
+Planned and not yet enabled. `cargo install --path .` is the canonical path until
+each channel lands.
+
+- **crates.io** — `cargo install shopify-rextant`  *(TBD)*
+- **Homebrew** — `brew install shopify-rextant`  *(TBD)*
+- **GitHub Releases** — prebuilt binaries + checksums  *(TBD)*
+- **Nix** — flake output  *(TBD)*
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
